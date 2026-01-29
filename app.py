@@ -18,7 +18,6 @@ st.write("Sistem deteksi duplikasi foto (Internal File & History Lintas Bulan)."
 def init_db():
     conn = sqlite3.connect('audit_history.db')
     c = conn.cursor()
-    # Membuat tabel jika belum ada
     c.execute('''CREATE TABLE IF NOT EXISTS foto_history 
                  (hash TEXT, cluster TEXT, segment TEXT, tanggal TEXT, sheet TEXT, posisi TEXT)''')
     conn.commit()
@@ -34,11 +33,10 @@ def cek_duplikat_history(p_hash):
 
 def simpan_ke_history(df):
     conn = sqlite3.connect('audit_history.db')
-    # Ambil data yang perlu saja untuk disimpan di history
+    # Filter data yang valid untuk disimpan
     history_df = df[['Hash', 'Cluster', 'Segment Name', 'Tanggal Patroli', 'Sheet', 'Posisi']]
     history_df.columns = ['hash', 'cluster', 'segment', 'tanggal', 'sheet', 'posisi']
     
-    # Hanya simpan hash yang belum ada di database agar tidak menumpuk duplikat di DB
     for _, row in history_df.iterrows():
         if not cek_duplikat_history(row['hash']):
             row_df = pd.DataFrame([row])
@@ -52,6 +50,9 @@ def get_images_and_data(file_path):
     
     for sheetname in wb.sheetnames:
         sheet = wb[sheetname]
+        if not hasattr(sheet, '_images'):
+            continue
+            
         for image in sheet._images:
             row = image.anchor._from.row + 1
             col = image.anchor._from.col + 1
@@ -66,7 +67,6 @@ def get_images_and_data(file_path):
             img = Image.open(img_data)
             p_hash = str(imagehash.phash(img))
             
-            # Cek apakah hash ini sudah pernah ada di database bulan-bulan sebelumnya
             match_history = cek_duplikat_history(p_hash)
             
             status_history = "✅ NEW"
@@ -85,52 +85,43 @@ def get_images_and_data(file_path):
             })
     return report_data
 
-# --- ALUR UTAMA (UI) ---
-init_db() # Jalankan database saat aplikasi start
+# --- ALUR UTAMA ---
+init_db()
 uploaded_file = st.file_uploader("Upload File Excel Patroli (.xlsx)", type=["xlsx"])
 
 if uploaded_file:
-    with st.spinner('Menganalisis data dan foto lintas database...'):
+    with st.spinner('Menganalisis data dan foto...'):
         with open("temp_file.xlsx", "wb") as f:
             f.write(uploaded_file.getbuffer())
-        
         data_foto = get_images_and_data("temp_file.xlsx")
         
     if data_foto:
         df = pd.DataFrame(data_foto)
         
-        # 1. Cek Duplikat di dalam file itu sendiri
+        # Cek Duplikat Internal
         is_duplicate_internal = df.duplicated('Hash', keep=False)
         
-        # 2. Gabungkan logika status
-        def tentukan_status(row):
+        def tentukan_status(index, row):
             if "DUPLIKAT HISTORY" in row['Status History']:
                 return "❌ DUPLICATE (HISTORY)"
-            elif is_duplicate_internal[df.index[df['Hash'] == row['Hash']][0]]:
+            elif is_duplicate_internal[index]:
                 return "❌ DUPLICATE (INTERNAL)"
             return "✅ REAL PICT"
 
-        df['Status Audit'] = df.apply(tentukan_status, axis=1)
+        df['Status Audit'] = [tentukan_status(i, r) for i, r in df.iterrows()]
         
         st.success(f"Analisis Selesai: {len(data_foto)} foto diproses.")
 
-        # Tombol Simpan ke History
-        if st.button("💾 Simpan Data Foto ini ke Database History"):
+        if st.button("💾 Simpan Data ke Database History"):
             simpan_ke_history(df)
-            st.toast("Data berhasil disimpan untuk audit bulan depan!")
+            st.success("Data disimpan untuk audit bulan depan!")
 
-        # Fitur Download
+        # Download Button
         output_df = df.drop(columns=['Image_Object'])
         towrite = io.BytesIO()
         output_df.to_excel(towrite, index=False)
         towrite.seek(0)
-        
-        st.download_button(
-            label="📥 Download Laporan Audit (.xlsx)",
-            data=towrite,
-            file_name="Laporan_Audit_Fiber_Optic.xlsx",
-            mime="application/vnd.ms-excel"
-        )
+        st.download_button("📥 Download Laporan LENGKAP", towrite, "Laporan_Audit.xlsx")
 
         tab1, tab2 = st.tabs(["📊 Tabel Hasil Audit", "🚩 Galeri Temuan"])
         
@@ -138,6 +129,16 @@ if uploaded_file:
             st.dataframe(df.drop(columns=['Image_Object']), use_container_width=True)
 
         with tab2:
-            duplikat_only = df[df['Status Audit'].str.contains("❌")].sort_values('Hash')
+            duplikat_only = df[df['Status Audit'].str.contains("❌")]
             if not duplikat_only.empty:
-                for h, group in duplikat_only.groupby('Hash
+                for h, group in duplikat_only.groupby('Hash'):
+                    st.divider()
+                    st.warning(f"Grup Foto Identik - Hash: {h}")
+                    cols = st.columns(len(group))
+                    for i, (idx, row) in enumerate(group.iterrows()):
+                        with cols[i]:
+                            st.image(row['Image_Object'], caption=f"{row['Cluster']} | {row['Posisi']}")
+            else:
+                st.success("Tidak ada duplikasi ditemukan!")
+    
+    if
