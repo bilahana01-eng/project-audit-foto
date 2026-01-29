@@ -1,121 +1,149 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
-import imagehash
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 from PIL import Image
-import requests
+import imagehash
 import io
 import os
+import sqlite3
+import requests
 import re
 
-# --- KONFIGURASI HALAMAN ---
-st.set_page_config(page_title="Audit Foto Link GDrive", layout="wide")
-st.title("🔍 Audit Foto Patroli (Versi Link GDrive)")
-st.write("Deteksi duplikasi lintas bulan menggunakan link Google Drive.")
+# --- KONFIGURASI ---
+st.set_page_config(page_title="Audit Foto Patroli Multi-Source", layout="wide")
+st.title("🔍 Audit Foto Patroli Fiber Optic (Bulan 1-4+)")
+st.write("Mendukung foto langsung di Excel & Link Google Drive.")
 
-# --- DATABASE LOGIC (INGATAN LINTAS BULAN) ---
-def get_db():
+# --- DATABASE (Ingatan Lintas Bulan) ---
+def get_db_connection():
     conn = sqlite3.connect('audit_history.db')
-    conn.execute('''CREATE TABLE IF NOT EXISTS history 
-                 (hash TEXT PRIMARY KEY, cluster TEXT, segment TEXT, tanggal TEXT, link TEXT)''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS foto_history 
+                 (hash TEXT PRIMARY KEY, cluster TEXT, segment TEXT, tanggal TEXT)''')
     return conn
 
 def cek_history(p_hash):
-    with get_db() as conn:
-        return conn.execute("SELECT cluster, tanggal, link FROM history WHERE hash=?", (p_hash,)).fetchone()
+    with get_db_connection() as conn:
+        return conn.execute("SELECT cluster, tanggal FROM foto_history WHERE hash=?", (p_hash,)).fetchone()
 
 def simpan_history(df):
-    with get_db() as conn:
+    with get_db_connection() as conn:
         for _, r in df.iterrows():
             try:
-                conn.execute("INSERT OR IGNORE INTO history VALUES (?,?,?,?,?)", 
-                             (r['Hash'], r['Cluster'], r['Segment Name'], r['Tanggal Patroli'], r['Link Foto']))
+                conn.execute("INSERT OR IGNORE INTO foto_history VALUES (?,?,?,?)", 
+                             (r['Hash'], r['Cluster'], r['Segment Name'], r['Tanggal Patroli']))
             except: pass
 
-# --- HELPER: KONVERSI LINK GDRIVE KE DIRECT DOWNLOAD ---
-def format_gdrive_link(link):
-    file_id_match = re.search(r'd/([^/]+)', link)
-    if file_id_match:
-        return f'https://drive.google.com/uc?export=download&id={file_id_match.group(1)}'
-    return link
-
-# --- PROSES DOWNLOAD & HASH ---
-def proses_audit_link(df):
-    results = []
-    progress_bar = st.progress(0)
-    total = len(df)
-    
-    for i, row in df.iterrows():
-        link_asli = str(row.get('Link Foto', ''))
-        direct_link = format_gdrive_link(link_asli)
+# --- FUNGSI DOWNLOAD GOOGLE DRIVE ---
+def download_gdrive_img(url):
+    try:
+        # Mengubah link gdrive biasa menjadi link direct download
+        file_id = ""
+        if 'id=' in url:
+            file_id = url.split('id=')[-1].split('&')[0]
+        elif '/d/' in url:
+            file_id = url.split('/d/')[1].split('/')[0]
         
-        try:
-            # Download gambar
-            response = requests.get(direct_link, timeout=10)
-            img = Image.open(io.BytesIO(response.content))
-            
-            # Hashing
-            h = str(imagehash.phash(img))
-            hist = cek_history(h)
-            
-            results.append({
-                "Cluster": row.get('Cluster', 'N/A'),
-                "Segment Name": row.get('Segment Name', 'N/A'),
-                "Tanggal Patroli": row.get('Tanggal Patroli', 'N/A'),
-                "Link Foto": link_asli,
-                "Hash": h,
-                "Hist_Info": f"⚠️ Duplikat Bulan Lalu di {hist[0]} ({hist[1]})" if hist else "✅ NEW",
-                "Img_Obj": img
-            })
-        except Exception as e:
-            st.error(f"Gagal akses link baris {i+1}: {e}")
-            
-        progress_bar.progress((i + 1) / total)
+        if file_id:
+            direct_url = f'https://drive.google.com/uc?export=download&id={file_id}'
+            response = requests.get(direct_url, timeout=10)
+            return Image.open(io.BytesIO(response.content))
+    except:
+        return None
+    return None
+
+# --- PROSES EXCEL ---
+def proses_excel(file):
+    wb = load_workbook(file, data_only=True)
+    results = []
+    
+    for sheet in wb.worksheets:
+        # 1. AMBIL FOTO TERTANAM (PICTURE LANGSUNG)
+        if hasattr(sheet, '_images'):
+            for img_obj in sheet._images:
+                row = img_obj.anchor._from.row + 1
+                col = img_obj.anchor._from.col + 1
+                
+                # Metadata (A=Cluster, B=Segment, C=Tanggal)
+                c_val = sheet.cell(row=row, column=1).value
+                s_val = sheet.cell(row=row, column=2).value
+                t_val = sheet.cell(row=row, column=3).value
+                
+                img = Image.open(io.BytesIO(img_obj._data()))
+                h = str(imagehash.phash(img))
+                hist = cek_history(h)
+                
+                results.append({
+                    "Cluster": str(c_val) if c_val else "N/A",
+                    "Segment Name": str(s_val) if s_val else "N/A",
+                    "Tanggal Patroli": str(t_val) if t_val else "N/A",
+                    "Posisi": f"Baris {row}, Kol {get_column_letter(col)}",
+                    "Tipe": "Embedded Image",
+                    "Hash": h,
+                    "Hist_Info": f"⚠️ Dulu di {hist[0]} ({hist[1]})" if hist else "✅ NEW",
+                    "Img_Obj": img
+                })
+
+        # 2. AMBIL FOTO DARI LINK GDRIVE (DI KOLOM E/5 - Sesuaikan jika beda)
+        # Scan baris 1 sampai 1000 (atau sesuai data kamu)
+        for r_idx in range(1, sheet.max_row + 1):
+            cell_url = sheet.cell(row=r_idx, column=5).value # Asumsi Link di Kolom E
+            if isinstance(cell_url, str) and "drive.google.com" in cell_url:
+                with st.spinner(f"Mendownload foto baris {r_idx}..."):
+                    img = download_gdrive_img(cell_url)
+                    if img:
+                        h = str(imagehash.phash(img))
+                        hist = cek_history(h)
+                        results.append({
+                            "Cluster": str(sheet.cell(row=r_idx, column=1).value) or "N/A",
+                            "Segment Name": str(sheet.cell(row=r_idx, column=2).value) or "N/A",
+                            "Tanggal Patroli": str(sheet.cell(row=r_idx, column=3).value) or "N/A",
+                            "Posisi": f"Baris {r_idx}, Kol E (Link)",
+                            "Tipe": "GDrive Link",
+                            "Hash": h,
+                            "Hist_Info": f"⚠️ Dulu di {hist[0]} ({hist[1]})" if hist else "✅ NEW",
+                            "Img_Obj": img
+                        })
+
     return results
 
-# --- UI UTAMA ---
-uploaded_file = st.file_uploader("Upload Excel (Kolom: Cluster, Segment Name, Tanggal Patroli, Link Foto)", type=["xlsx"])
+# --- UI ---
+up = st.file_uploader("Upload Excel Patroli (Bulan 1-4+)", type=["xlsx"])
 
-if uploaded_file:
-    df_input = pd.read_excel(uploaded_file)
+if up:
+    with st.spinner('Menganalisis foto & link...'):
+        with open("temp.xlsx", "wb") as f: f.write(up.getbuffer())
+        data = proses_excel("temp.xlsx")
     
-    if st.button("🚀 Mulai Audit Foto"):
-        data_hasil = proses_audit_link(df_input)
+    if data:
+        df = pd.DataFrame(data)
+        dup_internal = df.duplicated('Hash', keep=False)
         
-        if data_hasil:
-            res_df = pd.DataFrame(data_hasil)
+        def set_status(i, r):
+            if "Dulu" in r['Hist_Info']: return "❌ DUPLICATE (HISTORY MONTH)"
+            if dup_internal[i]: return "❌ DUPLICATE (INTERNAL FILE)"
+            return "✅ REAL PICT"
             
-            # Cek Duplikat Internal (dalam file yang sama)
-            is_dup_internal = res_df.duplicated('Hash', keep=False)
-            
-            def final_status(idx, r):
-                if "Duplikat Bulan Lalu" in r['Hist_Info']: return "❌ DUPLICATE (HISTORY)"
-                if is_dup_internal[idx]: return "❌ DUPLICATE (INTERNAL)"
-                return "✅ REAL PICT"
-            
-            res_df['Status Audit'] = [final_status(i, r) for i, r in res_df.iterrows()]
-            
-            st.success(f"Audit Selesai! {len(res_df)} foto diproses.")
-            
-            # Tombol Simpan
-            if st.button("💾 Simpan Hash ke Database (Untuk Audit Bulan Depan)"):
-                simpan_history(res_df)
-                st.success("Database diperbarui!")
+        df['Status Audit'] = [set_status(i, r) for i, r in df.iterrows()]
+        
+        st.success(f"Analisis Selesai! {len(df)} foto terdeteksi.")
+        
+        if st.button("💾 Simpan ke Database History (Untuk Bulan Depan)"):
+            simpan_history(df)
+            st.success("Data masuk ke memori audit!")
 
-            # Download Excel
-            output = res_df.drop(columns=['Img_Obj'])
-            towrite = io.BytesIO()
-            output.to_excel(towrite, index=False)
-            st.download_button("📥 Download Hasil Audit", towrite.getvalue(), "Hasil_Audit_GDrive.xlsx")
+        # Download Report
+        out = df.drop(columns=['Img_Obj'])
+        towrite = io.BytesIO()
+        out.to_excel(towrite, index=False)
+        st.download_button("📥 Download Laporan Hasil Audit", towrite.getvalue(), "Audit_Bulanan.xlsx")
 
-            # Galeri
-            t1, t2 = st.tabs(["📊 Data Tabel", "🚩 Temuan Duplikat"])
-            with t1: st.dataframe(output, use_container_width=True)
-            with t2:
-                dups = res_df[res_df['Status Audit'].str.contains("❌")]
-                for h, g in dups.groupby('Hash'):
-                    st.divider()
-                    st.error(f"Hash Identik: {h}")
-                    cols = st.columns(len(g))
-                    for i, (_, r) in enumerate(g.iterrows()):
-                        cols[i].image(r['Img_Obj'], caption=f"{r['Cluster']} | {r['Status Audit']}")
+        t1, t2 = st.tabs(["📊 Tabel Audit", "🚩 Galeri Foto"])
+        with t1: st.dataframe(out, use_container_width=True)
+        with t2:
+            for _, r in df.iterrows():
+                st.write(f"**{r['Cluster']} - {r['Status Audit']}** ({r['Posisi']})")
+                st.image(r['Img_Obj'], width=300)
+                st.divider()
+
+    if os.path.exists("temp.xlsx"): os.remove("temp.xlsx")
