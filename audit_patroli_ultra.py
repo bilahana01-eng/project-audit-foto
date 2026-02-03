@@ -11,9 +11,10 @@ import requests
 import re
 
 # --- KONFIGURASI ---
-st.set_page_config(page_title="Audit Foto Ultra", layout="wide")
-st.title("🛡️ Sistem Audit Foto Patroli Terintegrasi")
-st.markdown("Sistem otomatis deteksi duplikasi: **Embedded Image**, **Google Drive**, & **Google Docs**.")
+st.set_page_config(page_title="Audit Foto Duplicate", layout="wide")
+# Perubahan Judul sesuai permintaan
+st.title("🛡️ Audit Foto Duplicate")
+st.markdown("### Deteksi Otomatis Duplikasi")
 
 # --- DATABASE ENGINE ---
 def get_db_connection():
@@ -29,7 +30,7 @@ def cek_global_history(p_hash):
 # --- INTELLIGENT DOWNLOADER ---
 def smart_download(url):
     try:
-        # Regex untuk mengekstrak ID dari berbagai format GDrive/GDocs
+        # Regex yang lebih kuat untuk menangkap ID file dari GDocs/GDrive
         regex = r"(?<=/d/|id=)([a-zA-Z0-9-_]+)"
         match = re.search(regex, url)
         if not match: return None
@@ -37,10 +38,11 @@ def smart_download(url):
         file_id = match.group(1)
         direct_url = f'https://drive.google.com/uc?export=download&id={file_id}'
         
-        # Request dengan Timeout & Stream agar tidak hang
-        response = requests.get(direct_url, timeout=7, stream=True)
+        # Request dengan Timeout agar tidak hang jika koneksi lambat
+        response = requests.get(direct_url, timeout=10, stream=True)
         if response.status_code == 200:
             img = Image.open(io.BytesIO(response.content))
+            img = img.convert('RGB') # Standarisasi format
             img.thumbnail((300, 300)) # Optimasi RAM
             return img
     except:
@@ -57,20 +59,19 @@ def run_deep_audit(file_path):
         if hasattr(sheet, '_images'):
             for img_obj in sheet._images:
                 try:
-                    # Ambil lokasi baris & kolom foto tersebut berada
                     row_idx = img_obj.anchor._from.row + 1
                     col_idx = img_obj.anchor._from.col + 1
                     
-                    # Ambil metadata di sekitar foto (Asumsi: B=Cluster, C=Segment)
-                    cluster = sheet.cell(row=row_idx, column=2).value or "Unknown"
-                    segment = sheet.cell(row=row_idx, column=3).value or "Unknown"
+                    # Metadata (Asumsi Kolom B=Cluster, C=Segment)
+                    cluster = sheet.cell(row=row_idx, column=2).value or "N/A"
+                    segment = sheet.cell(row=row_idx, column=3).value or "N/A"
                     
                     img = Image.open(io.BytesIO(img_obj._data())).convert('RGB')
                     h = str(imagehash.phash(img))
                     
                     results.append({
                         "Source": "Embedded",
-                        "Location": f"Sheet {sheet.title} | Baris {row_idx}",
+                        "Location": f"{sheet.title} | Baris {row_idx}",
                         "Cluster": cluster, "Segment": segment,
                         "Hash": h, "Img_Obj": img
                     })
@@ -81,10 +82,10 @@ def run_deep_audit(file_path):
         for r in range(1, sheet.max_row + 1):
             cell_val = sheet.cell(row=r, column=7).value
             if cell_val and "google.com" in str(cell_val):
-                with st.status(f"Downloading Link Baris {r}...", expanded=False):
+                with st.status(f"Mengecek Link Baris {r}...", expanded=False) as status:
                     img = smart_download(str(cell_val))
                     if img:
-                        h = str(imagehash.phash(img.convert('RGB')))
+                        h = str(imagehash.phash(img))
                         results.append({
                             "Source": "Cloud Link",
                             "Location": f"Baris {r} (Kol G)",
@@ -92,57 +93,67 @@ def run_deep_audit(file_path):
                             "Segment": sheet.cell(row=r, column=3).value or "N/A",
                             "Hash": h, "Img_Obj": img
                         })
+                        status.update(label=f"Baris {r} Selesai!", state="complete")
+                    else:
+                        status.update(label=f"Baris {r} Gagal diunduh", state="error")
     return results
 
 # --- UI LOGIC ---
-uploaded = st.file_uploader("Upload File Patroli (.xlsx)", type=["xlsx"])
+uploaded = st.file_uploader("Upload File Excel Patroli (.xlsx)", type=["xlsx"])
 
 if uploaded:
     if st.button("🚀 JALANKAN FULL AUDIT"):
-        with open("temp.xlsx", "wb") as f: f.write(uploaded.getbuffer())
-        
-        raw_data = run_deep_audit("temp.xlsx")
-        
-        if raw_data:
-            df = pd.DataFrame(raw_data)
+        with st.spinner('Menganalisis data... Mohon tunggu.'):
+            # Simpan sementara file yang diupload
+            with open("temp_audit.xlsx", "wb") as f: 
+                f.write(uploaded.getbuffer())
             
-            # 1. Cek Duplikasi Internal (Dalam satu file)
-            df['is_internal_dup'] = df.duplicated('Hash', keep='first')
+            raw_data = run_deep_audit("temp_audit.xlsx")
             
-            # 2. Cek Duplikasi History (Bulan-bulan sebelumnya)
-            hist_check = []
-            for h in df['Hash']:
-                found = cek_global_history(h)
-                hist_check.append(f"⚠️ Dulu di {found[0]}" if found else "✅ NEW")
-            df['History_Status'] = hist_check
+            if raw_data:
+                df = pd.DataFrame(raw_data)
+                
+                # 1. Cek Duplikasi Internal (dalam satu file yang sama)
+                df['is_internal_dup'] = df.duplicated('Hash', keep='first')
+                
+                # 2. Cek Duplikasi History (Database bulan sebelumnya)
+                hist_check = []
+                for h in df['Hash']:
+                    found = cek_global_history(h)
+                    hist_check.append(f"⚠️ Pernah ada di: {found[0]}" if found else "✅ FOTO BARU")
+                df['History_Status'] = hist_check
 
-            # 3. Final Decision
-            def judge(row):
-                if "⚠️" in row['History_Status']: return "❌ GUGUR (HISTORY)"
-                if row['is_internal_dup']: return "❌ GUGUR (DUPLIKAT INTERNAL)"
-                return "✅ VALID"
-            
-            df['Final_Result'] = df.apply(judge, axis=1)
-            
-            st.divider()
-            st.success(f"Audit Selesai! {len(df)} entitas foto diproses.")
+                # 3. Keputusan Final Audit
+                def judge(row):
+                    if "⚠️" in row['History_Status']: return "❌ GUGUR (HISTORY)"
+                    if row['is_internal_dup']: return "❌ GUGUR (INTERNAL)"
+                    return "✅ VALID"
+                
+                df['Final_Result'] = df.apply(judge, axis=1)
+                
+                st.divider()
+                st.success(f"Audit Selesai! {len(df)} foto berhasil diproses.")
 
-            # DOWNLOAD HASIL
-            res_excel = df.drop(columns=['Img_Obj', 'Hash'])
-            towrite = io.BytesIO()
-            res_excel.to_excel(towrite, index=False)
-            st.download_button("📥 Download Laporan Audit", towrite.getvalue(), "Hasil_Audit_Lengkap.xlsx")
+                # EXCEL DOWNLOADER
+                res_excel = df.drop(columns=['Img_Obj', 'Hash'])
+                towrite = io.BytesIO()
+                res_excel.to_excel(towrite, index=False)
+                st.download_button("📥 Download Laporan Audit (.xlsx)", towrite.getvalue(), "Laporan_Audit_Duplicate.xlsx")
 
-            # DISPLAY TABS
-            t1, t2 = st.tabs(["📊 Tabel Analisis", "🖼️ Galeri Audit"])
-            with t1:
-                st.dataframe(res_excel, use_container_width=True)
-            with t2:
-                for _, r in df.iterrows():
-                    color = "red" if "GUGUR" in r['Final_Result'] else "green"
-                    st.markdown(f"### :{color}[{r['Final_Result']}]")
-                    st.write(f"**Cluster:** {r['Cluster']} | **Sumber:** {r['Source']}")
-                    st.image(r['Img_Obj'], width=350)
-                    st.divider()
-        else:
-            st.warning("Tidak ada data foto atau link yang dapat diidentifikasi.")
+                # VISUALISASI
+                t1, t2 = st.tabs(["📊 Hasil Tabel", "🖼️ Galeri Audit"])
+                with t1:
+                    st.dataframe(res_excel, use_container_width=True)
+                with t2:
+                    for _, r in df.iterrows():
+                        color = "red" if "❌" in r['Final_Result'] else "green"
+                        st.markdown(f"### :{color}[{r['Final_Result']}]")
+                        st.write(f"**Cluster:** {r['Cluster']} | **Sumber:** {r['Source']} | **Lokasi:** {r['Location']}")
+                        st.image(r['Img_Obj'], width=300)
+                        st.divider()
+            else:
+                st.warning("Tidak ditemukan foto tertanam atau link Google Drive yang valid.")
+
+    # Bersihkan file sementara
+    if os.path.exists("temp_audit.xlsx"):
+        os.remove("temp_audit.xlsx")
