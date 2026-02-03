@@ -12,8 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- KONFIGURASI ---
 st.set_page_config(page_title="Audit Foto Duplicate", layout="wide")
-st.title("🛡️ Audit Foto Duplicate")
-st.markdown("### Deteksi Otomatis Duplikasi (Versi Cepat & Stabil)")
+st.title("💾 AUDIT FOTO DUPLICATE")
+st.markdown("### Deteksi Otomatis Duplikasi")
 
 # --- DATABASE ENGINE ---
 def get_db_connection():
