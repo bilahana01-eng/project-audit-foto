@@ -4,4 +4,3 @@ openpyxl
 Pillow
 ImageHash
 requests
-pyarrow
