@@ -21,21 +21,16 @@ st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI")
 st.caption(
     "Audit foto patroli duplicate (Embedded Excel + Google Docs/Drive). "
-    "Aturan: LOGO-ONLY => SKIP (tidak masuk audit). "
-    "Foto patroli yang ada overlay GEO (kotak gelap + teks putih timestamp/koordinat) => DIAUDIT (VALID/GUGUR). "
-    "Logo perusahaan di foto GEO boleh (tetap diaudit)."
+    "RULE: Foto GEO overlay (kotak gelap + teks putih timestamp/koordinat) => DIAUDIT (VALID/GUGUR). "
+    "Logo-only/banner-only => SKIP (tidak ikut audit). Logo perusahaan pada foto GEO BOLEH."
 )
 
-# =========================
-# UPLOADER + SETTINGS (DI ATAS)
-# =========================
 uploaded = st.file_uploader("Upload Excel Patroli (.xlsx)", type=["xlsx"])
-
 colA, colB = st.columns([1, 2])
 with colA:
     preview_limit = st.number_input("Maks preview gambar", min_value=0, max_value=500, value=120, step=10)
 with colB:
-    st.info("Reset history ada di sidebar. Logo-only tidak ikut audit. Foto GEO overlay diaudit.")
+    st.info("Reset history ada di sidebar. Duplikat akan ditunjukkan 'duplikat dari foto mana' (internal & lintas bulan).")
 
 # =========================
 # DATABASE
@@ -59,16 +54,23 @@ def get_db():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_phash ON history(phash)")
+    # upgrade schema: add thumb blob if missing
+    try:
+        conn.execute("ALTER TABLE history ADD COLUMN thumb_jpg BLOB")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 def db_lookup(conn, sha256_hex: str, phash_str: str):
     exact = conn.execute(
-        "SELECT source_file, sheet, location, cluster, segment, url, first_seen FROM history WHERE sha256=?",
+        "SELECT source_file, sheet, location, cluster, segment, url, first_seen, thumb_jpg "
+        "FROM history WHERE sha256=?",
         (sha256_hex,)
     ).fetchone()
 
     ph = conn.execute(
-        "SELECT source_file, sheet, location, cluster, segment, url, first_seen FROM history WHERE phash=? LIMIT 1",
+        "SELECT source_file, sheet, location, cluster, segment, url, first_seen, thumb_jpg "
+        "FROM history WHERE phash=? LIMIT 1",
         (phash_str,)
     ).fetchone()
 
@@ -77,15 +79,16 @@ def db_lookup(conn, sha256_hex: str, phash_str: str):
 def db_insert(conn, row: dict):
     conn.execute("""
         INSERT OR IGNORE INTO history
-        (sha256, phash, source_type, source_file, sheet, location, cluster, segment, url, first_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (sha256, phash, source_type, source_file, sheet, location, cluster, segment, url, first_seen, thumb_jpg)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         row["sha256"], row["phash"], row["source_type"], row["source_file"],
-        row["sheet"], row["location"], row["cluster"], row["segment"], row["url"], row["first_seen"]
+        row["sheet"], row["location"], row["cluster"], row["segment"], row["url"], row["first_seen"],
+        row.get("thumb_jpg", None)
     ))
 
 # =========================
-# RESET / HAPUS HISTORY AUDIT (SIDEBAR)
+# RESET (SIDEBAR)
 # =========================
 st.sidebar.subheader("🧹 Reset History Audit")
 confirm_reset = st.sidebar.checkbox("Saya yakin mau hapus total history", value=False)
@@ -105,85 +108,111 @@ if st.sidebar.button("🗑️ HAPUS TOTAL HISTORY (RESET)"):
             st.sidebar.error(f"❌ Gagal hapus DB: {e}")
 
 # =========================
-# HASHING
+# HASHING + THUMB SERIALIZE
 # =========================
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
+
+def pil_to_jpg_bytes(img: Image.Image, max_size=240, quality=70) -> bytes:
+    t = img.copy()
+    t.thumbnail((max_size, max_size))
+    buf = io.BytesIO()
+    t.convert("RGB").save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+def jpg_bytes_to_pil(b: bytes) -> Image.Image | None:
+    if not b:
+        return None
+    try:
+        return Image.open(io.BytesIO(b)).convert("RGB")
+    except Exception:
+        return None
 
 def compute_hashes_from_bytes(img_bytes: bytes):
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except UnidentifiedImageError:
-        return None, None, None, None
+        return None, None, None, None, None
     thumb = img.copy()
     thumb.thumbnail((240, 240))
     ph = str(imagehash.phash(thumb))
     sh = sha256_bytes(img_bytes)
-    return sh, ph, thumb, img
+    thumb_jpg = pil_to_jpg_bytes(img, max_size=240, quality=70)
+    return sh, ph, thumb, img, thumb_jpg
 
 # =========================
-# LOGO-ONLY DETECTION
+# LOGO-ONLY DETECTION (ANTI FAMIKA DOANG)
 # =========================
-def image_entropy_gray(img: Image.Image) -> float:
-    g = img.convert("L").resize((256, 256))
-    hist = g.histogram()
-    total = sum(hist)
-    if total == 0:
-        return 0.0
-    ent = 0.0
-    for h in hist:
-        if h:
-            p = h / total
-            ent -= p * math.log2(p)
-    return ent
+def _down_rgb(img: Image.Image, size=256) -> Image.Image:
+    return img.resize((size, size))
 
-def edge_density(img: Image.Image) -> float:
-    g = img.convert("L").resize((256, 256)).filter(ImageFilter.FIND_EDGES)
-    px = list(g.getdata())
-    mean = sum(px) / (len(px) or 1)
-    return mean / 255.0
+def _near_white_ratio(rgb: Image.Image, thr=242) -> float:
+    px = list(rgb.getdata())
+    n = len(px) or 1
+    cnt = 0
+    for r, g, b in px:
+        if r >= thr and g >= thr and b >= thr:
+            cnt += 1
+    return cnt / n
 
-def dominant_color_count(img: Image.Image, k=16) -> int:
-    small = img.resize((256, 256))
-    pal = small.convert("P", palette=Image.Palette.ADAPTIVE, colors=k)
+def _dominant_colors(rgb: Image.Image, colors=24, min_frac=0.01) -> int:
+    pal = rgb.convert("P", palette=Image.Palette.ADAPTIVE, colors=colors)
     counts = pal.getcolors(256 * 256) or []
     total = 256 * 256
-    dom = sum(1 for c, _ in counts if (c / total) >= 0.015)
+    dom = 0
+    for c, _ in counts:
+        if (c / total) >= min_frac:
+            dom += 1
     return dom
 
+def _edge_ratio(edge_img: Image.Image, thr=40) -> float:
+    px = list(edge_img.getdata())
+    n = len(px) or 1
+    return sum(1 for p in px if p >= thr) / n
+
+def _edge_block_coverage(edge_img: Image.Image, grid=4, thr=40, min_block_ratio=0.015) -> int:
+    w, h = edge_img.size
+    bw = w // grid
+    bh = h // grid
+    active = 0
+    for gy in range(grid):
+        for gx in range(grid):
+            x0 = gx * bw
+            y0 = gy * bh
+            x1 = w if gx == grid - 1 else (gx + 1) * bw
+            y1 = h if gy == grid - 1 else (gy + 1) * bh
+            patch = edge_img.crop((x0, y0, x1, y1))
+            if _edge_ratio(patch, thr=thr) >= min_block_ratio:
+                active += 1
+    return active
+
 def is_logo_only(img: Image.Image) -> tuple[bool, str]:
-    """
-    Target: gambar logo/banner doang.
-    """
     w, h = img.size
-    if w < 140 or h < 140:
+    if w < 160 or h < 160:
         return True, "LogoOnly: kecil"
 
+    rgb = _down_rgb(img, 256)
+    gray = rgb.convert("L")
+    edge = gray.filter(ImageFilter.FIND_EDGES)
+
+    white = _near_white_ratio(rgb, thr=242)
+    dom = _dominant_colors(rgb, colors=24, min_frac=0.01)
+    blocks = _edge_block_coverage(edge, grid=4, thr=40, min_block_ratio=0.015)
+    er = _edge_ratio(edge, thr=40)
     ar = w / max(h, 1)
-    ent = image_entropy_gray(img)
-    ed  = edge_density(img)
 
-    g = img.convert("L").resize((256, 256))
-    px = list(g.getdata())
-    bright_ratio = sum(1 for p in px if p >= 238) / (len(px) or 1)
-    dom_colors = dominant_color_count(img, k=16)
+    # Logo putih (FAMIKA dll): putih tinggi + warna sedikit + edge tidak menyebar
+    if white >= 0.55 and dom <= 8 and blocks <= 6:
+        return True, f"LogoOnly: white={white:.2f}, dom={dom}, blocks={blocks}, er={er:.3f}"
 
-    # logo putih dominan
-    if bright_ratio >= 0.65 and dom_colors <= 6 and ed <= 0.070:
-        return True, f"LogoOnly: bright={bright_ratio:.2f}, dom={dom_colors}, edge={ed:.3f}"
+    # Banner lebar
+    if ar >= 2.1 and white >= 0.40 and dom <= 10 and blocks <= 6:
+        return True, f"LogoOnly: ar={ar:.2f}, white={white:.2f}, dom={dom}, blocks={blocks}"
 
-    # banner lebar
-    if ar >= 2.2 and ent <= 4.1 and dom_colors <= 8 and ed <= 0.090:
-        return True, f"LogoOnly: ar={ar:.2f}, ent={ent:.2f}, dom={dom_colors}, edge={ed:.3f}"
-
-    # sangat flat
-    if ent <= 3.3 and ed <= 0.070 and dom_colors <= 8:
-        return True, f"LogoOnly: ent={ent:.2f}, edge={ed:.3f}, dom={dom_colors}"
-
-    return False, f"NotLogo: ent={ent:.2f}, edge={ed:.3f}, bright={bright_ratio:.2f}, dom={dom_colors}"
+    return False, f"NotLogo: white={white:.2f}, dom={dom}, blocks={blocks}, er={er:.3f}"
 
 # =========================
-# GEO OVERLAY DETECTION (ANTI FALSE POSITIVE)
+# GEO OVERLAY DETECTION (SCAN BAWAH)
 # =========================
 def patch_edge_density(patch_gray: Image.Image) -> float:
     e = patch_gray.filter(ImageFilter.FIND_EDGES)
@@ -203,14 +232,6 @@ def _patch_stats(patch_gray: Image.Image):
     return mean, std, white_ratio, dark_ratio, ed
 
 def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
-    """
-    Overlay GEO harus punya:
-    - ada area gelap (kotak)
-    - ada area putih (teks)
-    - kontras cukup
-    - edge cukup (teks -> edge)
-    Scan area bawah.
-    """
     w, h = img.size
     if w < 240 or h < 240:
         return False, "NonGEO: kecil"
@@ -230,7 +251,6 @@ def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
         patch = img.crop((X0, Y0, X1, Y1)).convert("L").resize((260, 260))
         mean, std, white_ratio, dark_ratio, ed = _patch_stats(patch)
 
-        # threshold diset agar foto GEO lolos, tapi logo-only gak ketipu
         has_dark_box   = dark_ratio  >= 0.010
         has_white_text = white_ratio >= 0.003
         has_contrast   = std >= 12
@@ -238,33 +258,23 @@ def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
         edge_ok        = ed >= 0.030
 
         passed = has_dark_box and has_white_text and has_contrast and mean_ok and edge_ok
-
         dbg = (f"{name}: mean={mean:.1f}, std={std:.1f}, "
                f"white={white_ratio:.3f}, dark={dark_ratio:.3f}, edge={ed:.3f}, pass={passed}")
 
         if passed:
             return True, f"GEO✅ ({dbg})"
-
         best_dbg = dbg
 
     return False, f"NonGEO ({best_dbg})"
 
 def classify_for_audit(img: Image.Image) -> tuple[bool, str, str]:
-    """
-    ATURAN FINAL SESUAI KAMU:
-    1) LOGO-ONLY -> SKIP (Logo-Only). STOP. (tidak boleh masuk audit)
-    2) Bukan logo-only:
-       - GEO true -> AUDIT
-       - GEO false -> SKIP (Non-Patroli)
-    """
     logo, logo_dbg = is_logo_only(img)
     if logo:
         return False, "⏭️ SKIP (Logo-Only)", logo_dbg
 
     ok_geo, geo_dbg = overlay_geo_best(img)
     if ok_geo:
-        return True, "", ""  # AUDIT
-
+        return True, "", ""
     return False, "⏭️ SKIP (Non-Patroli)", geo_dbg
 
 # =========================
@@ -364,7 +374,7 @@ def extract_embedded_images(wb, source_file_name: str):
                 segment = ws.cell(row=row, column=col_segment).value or "N/A"
 
                 raw = img_obj._data()
-                sh, ph, thumb, full_img = compute_hashes_from_bytes(raw)
+                sh, ph, thumb, full_img, thumb_jpg = compute_hashes_from_bytes(raw)
                 if full_img is None:
                     continue
 
@@ -380,8 +390,11 @@ def extract_embedded_images(wb, source_file_name: str):
                         "url": "",
                         "sha256": "",
                         "phash": "",
+                        "thumb_jpg": None,
                         "status_akhir": skip_status,
                         "skip_reason": skip_reason,
+                        "dup_type": "",
+                        "dup_of": "",
                         "thumb": thumb
                     })
                     continue
@@ -396,8 +409,11 @@ def extract_embedded_images(wb, source_file_name: str):
                     "url": "",
                     "sha256": sh,
                     "phash": ph,
+                    "thumb_jpg": thumb_jpg,
                     "status_akhir": "",
                     "skip_reason": "",
+                    "dup_type": "",
+                    "dup_of": "",
                     "thumb": thumb
                 })
             except:
@@ -431,7 +447,7 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
         for idx, b in enumerate(img_bytes_list, start=1):
             if not b:
                 continue
-            sh, ph, thumb, full_img = compute_hashes_from_bytes(b)
+            sh, ph, thumb, full_img, thumb_jpg = compute_hashes_from_bytes(b)
             if full_img is None:
                 continue
 
@@ -447,8 +463,11 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
                     "url": url,
                     "sha256": "",
                     "phash": "",
+                    "thumb_jpg": None,
                     "status_akhir": skip_status,
                     "skip_reason": skip_reason,
+                    "dup_type": "",
+                    "dup_of": "",
                     "thumb": thumb
                 })
                 continue
@@ -463,8 +482,11 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
                 "url": url,
                 "sha256": sh,
                 "phash": ph,
+                "thumb_jpg": thumb_jpg,
                 "status_akhir": "",
                 "skip_reason": "",
+                "dup_type": "",
+                "dup_of": "",
                 "thumb": thumb
             })
         return out
@@ -480,7 +502,7 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
     return items
 
 # =========================
-# AUDIT LOGIC
+# AUDIT LOGIC (PAIRING DUPLICATE)
 # =========================
 def audit_workbook(xlsx_path: str):
     wb = load_workbook(xlsx_path, data_only=True)
@@ -494,33 +516,102 @@ def audit_workbook(xlsx_path: str):
     df_audit = df[audited_mask].copy()
     df_skip = df[~audited_mask].copy()
 
+    # kalau semua SKIP
     if df_audit.empty:
-        for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen"]:
+        for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen","ref_thumb_jpg"]:
             df[col] = ""
         return df
 
-    df_audit["dup_internal_exact"] = df_audit.duplicated("sha256", keep="first")
-    df_audit["dup_internal_phash"] = df_audit.duplicated("phash", keep="first")
+    # -------- INTERNAL DUP: tentukan "duplikat dari mana"
+    first_idx_sha = {}
+    first_idx_ph = {}
+    dup_internal_exact = []
+    dup_internal_ph = []
+    dup_of_internal = []
+    dup_type_internal = []
 
+    for idx, r in df_audit.iterrows():
+        sh = r["sha256"]
+        ph = r["phash"]
+
+        # exact
+        if sh in first_idx_sha:
+            dup_internal_exact.append(True)
+            ref_i = first_idx_sha[sh]
+            ref = df_audit.loc[ref_i]
+            dup_of_internal.append(f"{ref['source_file']} | {ref['sheet']} | {ref['location']}")
+            dup_type_internal.append("INTERNAL_EXACT")
+        else:
+            first_idx_sha[sh] = idx
+            dup_internal_exact.append(False)
+            dup_of_internal.append("")
+            dup_type_internal.append("")
+
+        # phash (similar)
+        if ph in first_idx_ph:
+            dup_internal_ph.append(True)
+            # kalau belum punya ref dari exact, isi ref dari phash
+            if dup_of_internal[-1] == "":
+                ref_i = first_idx_ph[ph]
+                ref = df_audit.loc[ref_i]
+                dup_of_internal[-1] = f"{ref['source_file']} | {ref['sheet']} | {ref['location']}"
+                dup_type_internal[-1] = "INTERNAL_SIMILAR"
+        else:
+            first_idx_ph[ph] = idx
+            dup_internal_ph.append(False)
+
+    df_audit["dup_internal_exact"] = dup_internal_exact
+    df_audit["dup_internal_phash"] = dup_internal_ph
+
+    # -------- HISTORY DUP: cek DB
     conn = get_db()
     today = datetime.now().strftime("%Y-%m-%d")
     df_audit["first_seen"] = today
 
-    hist_status, hist_detail = [], []
+    hist_status, hist_detail, ref_thumb = [], [], []
+    dup_type_final, dup_of_final = [], []
+
     for _, row in df_audit.iterrows():
         exact, ph = db_lookup(conn, row["sha256"], row["phash"])
+
+        # default (kalau internal sudah isi)
+        dtyp = row.get("dup_type", "") or ""
+        dof = row.get("dup_of", "") or ""
+
         if exact:
             hist_status.append("REUPLOAD_EXACT")
-            hist_detail.append(f"Pernah terbit {exact[-1]} | {exact[0]} | {exact[1]} | {exact[2]}")
+            hist_detail.append(f"Pernah terbit {exact[6]} | {exact[0]} | {exact[1]} | {exact[2]}")
+            ref_thumb.append(exact[7])
+            dup_type_final.append("HISTORY_EXACT")
+            dup_of_final.append(f"{exact[0]} | {exact[1]} | {exact[2]} | {exact[6]}")
         elif ph:
             hist_status.append("REUPLOAD_SIMILAR_PHASH")
-            hist_detail.append(f"Mirip phash: {ph[-1]} | {ph[0]} | {ph[1]} | {ph[2]}")
+            hist_detail.append(f"Mirip foto lama {ph[6]} | {ph[0]} | {ph[1]} | {ph[2]}")
+            ref_thumb.append(ph[7])
+            dup_type_final.append("HISTORY_SIMILAR")
+            dup_of_final.append(f"{ph[0]} | {ph[1]} | {ph[2]} | {ph[6]}")
         else:
             hist_status.append("NEW")
             hist_detail.append("")
+            ref_thumb.append(None)
+            # kalau ada internal dup, simpan itu; kalau tidak, NONE
+            if row["sha256"] in first_idx_sha and row.name != first_idx_sha[row["sha256"]]:
+                dup_type_final.append("INTERNAL_EXACT")
+                dup_of_final.append(dup_of_internal[list(df_audit.index).index(row.name)])
+            elif row["phash"] in first_idx_ph and row.name != first_idx_ph[row["phash"]]:
+                dup_type_final.append("INTERNAL_SIMILAR")
+                dup_of_final.append(dup_of_internal[list(df_audit.index).index(row.name)])
+            else:
+                dup_type_final.append("NONE")
+                dup_of_final.append("")
+
     df_audit["history_status"] = hist_status
     df_audit["history_detail"] = hist_detail
+    df_audit["ref_thumb_jpg"] = ref_thumb
+    df_audit["dup_type"] = dup_type_final
+    df_audit["dup_of"] = dup_of_final
 
+    # -------- FINAL DECISION
     def decide(r):
         if r["history_status"] == "REUPLOAD_EXACT":
             return "❌ GUGUR (Pernah Terbit - Exact)"
@@ -534,7 +625,14 @@ def audit_workbook(xlsx_path: str):
 
     df_audit["status_akhir"] = df_audit.apply(decide, axis=1)
 
-    for _, r in df_audit[df_audit["status_akhir"] == "✅ VALID"].iterrows():
+    # -------- SIMPAN KE DB: simpan foto pertama (NEW + bukan duplikat exact internal)
+    # supaya bulan depan bisa detect reupload meski file rename
+    for idx, r in df_audit.iterrows():
+        if r["history_status"] != "NEW":
+            continue
+        if r["dup_internal_exact"]:
+            continue
+        # simpan first occurrence (exact unik)
         db_insert(conn, {
             "sha256": r["sha256"],
             "phash": r["phash"],
@@ -545,16 +643,20 @@ def audit_workbook(xlsx_path: str):
             "cluster": r["cluster"],
             "segment": r["segment"],
             "url": r["url"],
-            "first_seen": r["first_seen"]
+            "first_seen": r["first_seen"],
+            "thumb_jpg": r.get("thumb_jpg", None)
         })
+
     conn.commit()
     conn.close()
 
-    for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen"]:
+    # rapihin kolom skip
+    for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen","ref_thumb_jpg"]:
         if col not in df_skip.columns:
             df_skip[col] = ""
 
-    return pd.concat([df_audit, df_skip], ignore_index=True)
+    out = pd.concat([df_audit, df_skip], ignore_index=True)
+    return out
 
 # =========================
 # RUN UI
@@ -579,27 +681,28 @@ if uploaded:
                                   (df["status_akhir"].astype(str).str.contains("CEK MANUAL"))]
 
                 st.subheader("Ringkasan (HANYA yang diaudit)")
-                c1, c2, c3, c4 = st.columns(4)
+                c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Total Diaudit", len(audited_only))
                 c2.metric("VALID", int((audited_only["status_akhir"] == "✅ VALID").sum()))
                 c3.metric("GUGUR", int(audited_only["status_akhir"].astype(str).str.contains("GUGUR").sum()))
                 c4.metric("CEK MANUAL", int(audited_only["status_akhir"].astype(str).str.contains("CEK MANUAL").sum()))
+                c5.metric("SKIP", int(df["status_akhir"].astype(str).str.startswith("⏭️ SKIP").sum()))
 
                 st.subheader("Laporan (Termasuk SKIP)")
-                report = df.drop(columns=["thumb"], errors="ignore")
+                report = df.drop(columns=["thumb", "thumb_jpg", "ref_thumb_jpg"], errors="ignore")
                 st.dataframe(report, use_container_width=True)
 
-                out = io.BytesIO()
-                report.to_excel(out, index=False)
+                out_x = io.BytesIO()
+                report.to_excel(out_x, index=False)
                 today = datetime.now().strftime("%Y-%m-%d")
                 st.download_button(
                     "📥 Download Laporan (Excel)",
-                    data=out.getvalue(),
+                    data=out_x.getvalue(),
                     file_name=f"Laporan_Audit_Foto_{today}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
 
-                st.subheader("Preview (dibatasi)")
+                st.subheader("Preview (dibatasi) + Referensi Duplikat")
                 shown = 0
                 cols = st.columns(4)
 
@@ -622,12 +725,25 @@ if uploaded:
                         break
                     if r.get("thumb") is None:
                         continue
+
                     with cols[shown % 4]:
                         st.image(r["thumb"], caption=f'{r["sheet"]} | {r["location"]}\n{r["status_akhir"]}')
+
                         if r.get("skip_reason"):
                             st.caption(r["skip_reason"])
+
+                        # tampilkan "duplikat dari mana"
+                        if str(r.get("dup_type", "")).strip() and str(r.get("dup_type", "")).strip() != "NONE":
+                            st.caption(f"🔁 {r.get('dup_type')} dari: {r.get('dup_of')}")
+
+                        # kalau duplikat lintas bulan: tampilkan thumbnail referensi dari DB
+                        ref_img = jpg_bytes_to_pil(r.get("ref_thumb_jpg", None))
+                        if ref_img is not None:
+                            st.image(ref_img, caption="📌 Foto referensi (history)")
+
                         if r.get("history_detail"):
                             st.caption(r["history_detail"])
+
                     shown += 1
 
     if os.path.exists(tmp_path):
