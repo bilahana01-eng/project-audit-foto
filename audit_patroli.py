@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from openpyxl import load_workbook
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError, ImageFilter
 import imagehash
 import io
 import os
@@ -12,25 +12,30 @@ import hashlib
 import requests
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
 
 # =========================
 # CONFIG UI
 # =========================
 st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI")
-st.caption("Audit foto patroli yang terduplicate (Embedded Excel + Google Docs/Drive). Tidak pakai slider filter. Skip hanya berdasarkan keyword.")
+st.caption(
+    "Audit foto patroli duplicate (Embedded Excel + Google Docs/Drive). "
+    "Foto patroli yang punya overlay GEO (timestamp/koordinat + kotak gelap + teks putih) akan DIAUDIT (VALID/GUGUR). "
+    "Logo-only / banner-only akan di-SKIP (tidak masuk VALID/GUGUR). "
+    "Logo perusahaan di foto GEO itu BOLEH (tetap diaudit)."
+)
 
 # =========================
-# SKIP RULE (TANPA SLIDER)
+# STREAMLIT UI (UPLOADER DI ATAS)
 # =========================
-# Hanya skip jika segment mengandung keyword ini:
-SKIP_SEGMENT_KEYWORDS = ["logo", "cover", "header", "template"]
+uploaded = st.file_uploader("Upload Excel Patroli (.xlsx)", type=["xlsx"])
 
-def should_skip(segment_text: str) -> tuple[bool, str]:
-    seg = (segment_text or "").strip().lower()
-    if any(k in seg for k in SKIP_SEGMENT_KEYWORDS):
-        return True, "SKIP: segment keyword"
-    return False, ""
+colA, colB = st.columns([1, 2])
+with colA:
+    preview_limit = st.number_input("Maks preview gambar", min_value=0, max_value=500, value=120, step=10)
+with colB:
+    st.info("Reset history ada di sidebar kiri. Logo-only tidak ikut audit, GEO overlay akan diaudit.")
 
 # =========================
 # DATABASE
@@ -80,7 +85,7 @@ def db_insert(conn, row: dict):
     ))
 
 # =========================
-# RESET / HAPUS HISTORY AUDIT (AMAN)
+# RESET / HAPUS HISTORY AUDIT (SIDEBAR)
 # =========================
 st.sidebar.subheader("🧹 Reset History Audit")
 confirm_reset = st.sidebar.checkbox("Saya yakin mau hapus total history", value=False)
@@ -109,12 +114,161 @@ def compute_hashes_from_bytes(img_bytes: bytes):
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except UnidentifiedImageError:
-        return None, None, None
+        return None, None, None, None
     thumb = img.copy()
-    thumb.thumbnail((220, 220))
+    thumb.thumbnail((240, 240))
     ph = str(imagehash.phash(thumb))
     sh = sha256_bytes(img_bytes)
-    return sh, ph, thumb
+    return sh, ph, thumb, img
+
+# =========================
+# HELPER METRIK (LOGO-ONLY)
+# =========================
+def image_entropy_gray(img: Image.Image) -> float:
+    g = img.convert("L").resize((256, 256))
+    hist = g.histogram()
+    total = sum(hist)
+    if total == 0:
+        return 0.0
+    ent = 0.0
+    for h in hist:
+        if h:
+            p = h / total
+            ent -= p * math.log2(p)
+    return ent
+
+def edge_density(img: Image.Image) -> float:
+    g = img.convert("L").resize((256, 256)).filter(ImageFilter.FIND_EDGES)
+    px = list(g.getdata())
+    mean = sum(px) / (len(px) or 1)
+    return mean / 255.0
+
+def dominant_color_count(img: Image.Image, k=16) -> int:
+    """
+    Hitung jumlah warna dominan (yang signifikan).
+    Logo-only biasanya warna dominan sedikit.
+    """
+    small = img.resize((256, 256))
+    pal = small.convert("P", palette=Image.Palette.ADAPTIVE, colors=k)
+    counts = pal.getcolors(256 * 256) or []
+    total = 256 * 256
+    # hitung warna yg >=1.5% area
+    dom = sum(1 for c, _ in counts if (c / total) >= 0.015)
+    return dom
+
+def is_logo_only(img: Image.Image) -> tuple[bool, str]:
+    """
+    LOGO-ONLY = gambar yang mayoritas flat/background + sedikit elemen logo.
+    Tujuan: logo-only harus SKIP dan TIDAK BOLEH masuk audit.
+    """
+    w, h = img.size
+    if w < 140 or h < 140:
+        return True, "LogoOnly: terlalu kecil"
+
+    ar = w / max(h, 1)
+    ent = image_entropy_gray(img)
+    ed  = edge_density(img)
+
+    g = img.convert("L").resize((256, 256))
+    px = list(g.getdata())
+    bright_ratio = sum(1 for p in px if p >= 238) / (len(px) or 1)  # putih dominan
+
+    dom_colors = dominant_color_count(img, k=16)
+
+    # RULE KUAT: putih dominan + sedikit warna + edge rendah -> logo-only (FAMIKA putih)
+    if bright_ratio >= 0.55 and dom_colors <= 6 and ed <= 0.070:
+        return True, f"LogoOnly: bright={bright_ratio:.2f}, domColor={dom_colors}, edge={ed:.3f}"
+
+    # RULE KUAT: banner lebar + entropi rendah -> logo/banner (Indosat banner)
+    if ar >= 2.0 and ent <= 4.2 and dom_colors <= 8:
+        return True, f"LogoOnly: ar={ar:.2f}, ent={ent:.2f}, domColor={dom_colors}"
+
+    # RULE TAMBAHAN: sangat flat (ent rendah & edge rendah)
+    if ent < 3.4 and ed < 0.060:
+        return True, f"LogoOnly: ent={ent:.2f}, edge={ed:.3f}"
+
+    return False, f"NotLogo: ent={ent:.2f}, edge={ed:.3f}, bright={bright_ratio:.2f}, domColor={dom_colors}"
+
+# =========================
+# GEO OVERLAY DETECTION (DIPERKETAT)
+# =========================
+def _patch_stats(patch_gray: Image.Image):
+    px = list(patch_gray.getdata())
+    n = len(px) or 1
+    mean = sum(px) / n
+    var = sum((p - mean) ** 2 for p in px) / n
+    std = math.sqrt(var)
+    white_ratio = sum(1 for p in px if p >= 225) / n
+    dark_ratio  = sum(1 for p in px if p <= 80) / n
+    return mean, std, white_ratio, dark_ratio
+
+def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
+    """
+    FIX utama:
+    - WAJIB ada dark box + white text
+    - mean patch cenderung lebih gelap (bukan putih polos)
+    Ini biar logo-only nggak “ketipu” jadi GEO.
+    """
+    w, h = img.size
+    if w < 240 or h < 240:
+        return False, "NonGEO: ukuran kecil"
+
+    rois = [
+        ("LB", (0.00, 0.65, 0.45, 1.00)),
+        ("MB", (0.25, 0.65, 0.75, 1.00)),
+        ("RB", (0.55, 0.65, 1.00, 1.00)),
+    ]
+
+    best_pass = False
+    best_dbg = ""
+
+    for name, (x0, y0, x1, y1) in rois:
+        X0 = int(w * x0); Y0 = int(h * y0)
+        X1 = int(w * x1); Y1 = int(h * y1)
+
+        patch = img.crop((X0, Y0, X1, Y1)).convert("L").resize((240, 240))
+        mean, std, white_ratio, dark_ratio = _patch_stats(patch)
+
+        # overlay GEO biasanya: ada kotak gelap + teks putih + kontras
+        has_dark_box = dark_ratio >= 0.012
+        has_white_text = white_ratio >= 0.006
+        has_contrast = std >= 14
+        mean_ok = mean <= 185  # kalau putih polos, mean tinggi
+
+        passed = has_dark_box and has_white_text and has_contrast and mean_ok
+        dbg = (
+            f"{name}: mean={mean:.1f}, std={std:.1f}, "
+            f"white={white_ratio:.3f}, dark={dark_ratio:.3f}, pass={passed}"
+        )
+
+        if passed:
+            best_pass = True
+            best_dbg = dbg
+            break
+
+        # simpan debug terakhir biar ada alasan di UI
+        best_dbg = dbg
+
+    if best_pass:
+        return True, f"GEO✅ ({best_dbg})"
+    return False, f"NonGEO ({best_dbg})"
+
+def classify_for_audit(img: Image.Image) -> tuple[bool, str, str]:
+    """
+    RULE FINAL sesuai permintaanmu:
+    1) Logo-only -> SKIP (Logo-Only) (TIDAK DIAUDIT)
+    2) Bukan logo-only:
+       - Ada GEO overlay -> AUDIT (valid/gugur)
+       - Tidak ada GEO -> SKIP (Non-Patroli)
+    """
+    logo, logo_dbg = is_logo_only(img)
+    if logo:
+        return False, "⏭️ SKIP (Logo-Only)", logo_dbg
+
+    ok, geo_dbg = overlay_geo_best(img)
+    if ok:
+        return True, "", ""
+    return False, "⏭️ SKIP (Non-Patroli)", geo_dbg
 
 # =========================
 # GOOGLE LINK HANDLING
@@ -129,9 +283,9 @@ def build_gdocs_export_docx_url(doc_id: str) -> str:
 def build_drive_download_url(file_id: str) -> str:
     return f"https://drive.google.com/uc?export=download&id={file_id}"
 
-def http_get_bytes(session: requests.Session, url: str, timeout=25):
+def http_get_bytes(url: str, timeout=25):
     try:
-        r = session.get(url, timeout=timeout, stream=True, allow_redirects=True)
+        r = requests.get(url, timeout=timeout, stream=True, allow_redirects=True)
         if r.status_code != 200:
             return None
         return r.content
@@ -149,26 +303,26 @@ def extract_images_from_docx_bytes(docx_bytes: bytes) -> list[bytes]:
                     pass
     return out
 
-def download_images_from_url(session: requests.Session, url: str) -> list[bytes]:
+def download_images_from_url(url: str) -> list[bytes]:
     if not url or not isinstance(url, str):
         return []
 
     m = DOC_ID_RE.search(url)
     if m:
         doc_id = m.group(1)
-        docx_bytes = http_get_bytes(session, build_gdocs_export_docx_url(doc_id))
+        docx_bytes = http_get_bytes(build_gdocs_export_docx_url(doc_id))
         if not docx_bytes:
             return []
         return extract_images_from_docx_bytes(docx_bytes)
 
     m = DRIVE_FILE_ID_RE.search(url)
     if m:
-        b = http_get_bytes(session, build_drive_download_url(m.group(1)))
+        b = http_get_bytes(build_drive_download_url(m.group(1)))
         return [b] if b else []
 
     m = GENERIC_ID_RE.search(url)
     if m and "google" in url:
-        b = http_get_bytes(session, build_drive_download_url(m.group(1)))
+        b = http_get_bytes(build_drive_download_url(m.group(1)))
         return [b] if b else []
 
     return []
@@ -212,13 +366,27 @@ def extract_embedded_images(wb, source_file_name: str):
                 cluster = ws.cell(row=row, column=col_cluster).value or "N/A"
                 segment = ws.cell(row=row, column=col_segment).value or "N/A"
 
-                skip, reason = should_skip(str(segment))
-                if skip:
+                raw = img_obj._data()
+                sh, ph, thumb, full_img = compute_hashes_from_bytes(raw)
+                if full_img is None:
                     continue
 
-                img_bytes = img_obj._data()
-                sh, ph, thumb = compute_hashes_from_bytes(img_bytes)
-                if not sh:
+                audit_ok, skip_status, skip_reason = classify_for_audit(full_img)
+                if not audit_ok:
+                    items.append({
+                        "source_type": "EmbeddedExcel",
+                        "source_file": source_file_name,
+                        "sheet": ws.title,
+                        "location": f"R{row}C{col}",
+                        "cluster": str(cluster),
+                        "segment": str(segment),
+                        "url": "",
+                        "sha256": "",
+                        "phash": "",
+                        "status_akhir": skip_status,
+                        "skip_reason": skip_reason,
+                        "thumb": thumb
+                    })
                     continue
 
                 items.append({
@@ -231,6 +399,8 @@ def extract_embedded_images(wb, source_file_name: str):
                     "url": "",
                     "sha256": sh,
                     "phash": ph,
+                    "status_akhir": "",
+                    "skip_reason": "",
                     "thumb": thumb
                 })
             except:
@@ -238,9 +408,7 @@ def extract_embedded_images(wb, source_file_name: str):
     return items
 
 def extract_link_images(wb, source_file_name: str, max_workers=12):
-    items = []
     jobs = []
-
     for ws in wb.worksheets:
         header_row, col_cluster, col_segment, col_link = find_header_row_and_cols(ws)
         for r in range(header_row + 1, ws.max_row + 1):
@@ -250,32 +418,44 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
             url = str(url)
             if "google" not in url:
                 continue
-
             cluster = ws.cell(r, col_cluster).value or "N/A"
             segment = ws.cell(r, col_segment).value or "N/A"
-
-            skip, reason = should_skip(str(segment))
-            if skip:
-                continue
-
             jobs.append((ws.title, r, col_link, str(cluster), str(segment), url))
 
+    items = []
     if not jobs:
         return items
 
-    session = requests.Session()
-    session.headers.update({"User-Agent": "PatrolPhotoAudit/1.0"})
-
     def worker(job):
         sheet, r, col_link, cluster, segment, url = job
-        img_bytes_list = download_images_from_url(session, url)
+        img_bytes_list = download_images_from_url(url)
+
         out = []
         for idx, b in enumerate(img_bytes_list, start=1):
             if not b:
                 continue
-            sh, ph, thumb = compute_hashes_from_bytes(b)
-            if not sh:
+            sh, ph, thumb, full_img = compute_hashes_from_bytes(b)
+            if full_img is None:
                 continue
+
+            audit_ok, skip_status, skip_reason = classify_for_audit(full_img)
+            if not audit_ok:
+                out.append({
+                    "source_type": "CloudLink",
+                    "source_file": source_file_name,
+                    "sheet": sheet,
+                    "location": f"R{r}C{col_link}#IMG{idx}",
+                    "cluster": cluster,
+                    "segment": segment,
+                    "url": url,
+                    "sha256": "",
+                    "phash": "",
+                    "status_akhir": skip_status,
+                    "skip_reason": skip_reason,
+                    "thumb": thumb
+                })
+                continue
+
             out.append({
                 "source_type": "CloudLink",
                 "source_file": source_file_name,
@@ -286,6 +466,8 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
                 "url": url,
                 "sha256": sh,
                 "phash": ph,
+                "status_akhir": "",
+                "skip_reason": "",
                 "thumb": thumb
             })
         return out
@@ -307,20 +489,28 @@ def audit_workbook(xlsx_path: str):
     wb = load_workbook(xlsx_path, data_only=True)
     source_file_name = os.path.basename(xlsx_path)
 
-    all_items = extract_embedded_images(wb, source_file_name) + extract_link_images(wb, source_file_name)
-    df = pd.DataFrame(all_items)
+    df = pd.DataFrame(extract_embedded_images(wb, source_file_name) + extract_link_images(wb, source_file_name))
     if df.empty:
         return df
 
-    df["dup_internal_exact"] = df.duplicated("sha256", keep="first")
-    df["dup_internal_phash"] = df.duplicated("phash", keep="first")
+    audited_mask = (df["status_akhir"].astype(str).str.strip() == "") & (df["sha256"].astype(str).str.strip() != "")
+    df_audit = df[audited_mask].copy()
+    df_skip = df[~audited_mask].copy()
+
+    if df_audit.empty:
+        for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen"]:
+            df[col] = ""
+        return df
+
+    df_audit["dup_internal_exact"] = df_audit.duplicated("sha256", keep="first")
+    df_audit["dup_internal_phash"] = df_audit.duplicated("phash", keep="first")
 
     conn = get_db()
     today = datetime.now().strftime("%Y-%m-%d")
-    df["first_seen"] = today
+    df_audit["first_seen"] = today
 
     hist_status, hist_detail = [], []
-    for _, row in df.iterrows():
+    for _, row in df_audit.iterrows():
         exact, ph = db_lookup(conn, row["sha256"], row["phash"])
         if exact:
             hist_status.append("REUPLOAD_EXACT")
@@ -331,8 +521,8 @@ def audit_workbook(xlsx_path: str):
         else:
             hist_status.append("NEW")
             hist_detail.append("")
-    df["history_status"] = hist_status
-    df["history_detail"] = hist_detail
+    df_audit["history_status"] = hist_status
+    df_audit["history_detail"] = hist_detail
 
     def decide(r):
         if r["history_status"] == "REUPLOAD_EXACT":
@@ -345,9 +535,9 @@ def audit_workbook(xlsx_path: str):
             return "⚠️ CEK MANUAL (Duplikat Mirip di File Ini)"
         return "✅ VALID"
 
-    df["status_akhir"] = df.apply(decide, axis=1)
+    df_audit["status_akhir"] = df_audit.apply(decide, axis=1)
 
-    for _, r in df[df["status_akhir"] == "✅ VALID"].iterrows():
+    for _, r in df_audit[df_audit["status_akhir"] == "✅ VALID"].iterrows():
         db_insert(conn, {
             "sha256": r["sha256"],
             "phash": r["phash"],
@@ -363,19 +553,15 @@ def audit_workbook(xlsx_path: str):
     conn.commit()
     conn.close()
 
-    return df
+    for col in ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen"]:
+        if col not in df_skip.columns:
+            df_skip[col] = ""
+
+    return pd.concat([df_audit, df_skip], ignore_index=True)
 
 # =========================
-# STREAMLIT UI
+# RUN UI
 # =========================
-uploaded = st.file_uploader("Upload Excel Patroli (.xlsx)", type=["xlsx"])
-
-colA, colB = st.columns([1, 2])
-with colA:
-    preview_limit = st.number_input("Maks preview gambar", min_value=0, max_value=500, value=120, step=10)
-with colB:
-    st.info("Tidak ada slider filter. Skip hanya bila Segment mengandung keyword (logo/header/template/cover).")
-
 if uploaded:
     tmp_path = "temp_upload.xlsx"
     with open(tmp_path, "wb") as f:
@@ -391,14 +577,18 @@ if uploaded:
             else:
                 status.update(label="Audit selesai.", state="complete")
 
-                st.subheader("Ringkasan")
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total Foto", len(df))
-                c2.metric("VALID", int((df["status_akhir"] == "✅ VALID").sum()))
-                c3.metric("GUGUR", int(df["status_akhir"].astype(str).str.contains("GUGUR").sum()))
-                c4.metric("CEK MANUAL", int(df["status_akhir"].astype(str).str.contains("CEK MANUAL").sum()))
+                audited_only = df[(df["status_akhir"].astype(str).str.startswith("✅")) |
+                                  (df["status_akhir"].astype(str).str.contains("GUGUR")) |
+                                  (df["status_akhir"].astype(str).str.contains("CEK MANUAL"))]
 
-                st.subheader("Laporan")
+                st.subheader("Ringkasan (HANYA yang diaudit)")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Total Diaudit", len(audited_only))
+                c2.metric("VALID", int((audited_only["status_akhir"] == "✅ VALID").sum()))
+                c3.metric("GUGUR", int(audited_only["status_akhir"].astype(str).str.contains("GUGUR").sum()))
+                c4.metric("CEK MANUAL", int(audited_only["status_akhir"].astype(str).str.contains("CEK MANUAL").sum()))
+
+                st.subheader("Laporan (Termasuk SKIP)")
                 report = df.drop(columns=["thumb"], errors="ignore")
                 st.dataframe(report, use_container_width=True)
 
@@ -415,18 +605,30 @@ if uploaded:
                 st.subheader("Preview (dibatasi)")
                 shown = 0
                 cols = st.columns(4)
-                # prioritas: bermasalah dulu
-                dfv = df.copy()
-                pr = dfv["status_akhir"].map(lambda s: 0 if "GUGUR" in str(s) or "CEK MANUAL" in str(s) else 1)
-                dfv = dfv.assign(_p=pr).sort_values("_p").drop(columns=["_p"])
 
-                for _, r in dfv.iterrows():
+                def prio(s):
+                    s = str(s)
+                    if "GUGUR" in s or "CEK MANUAL" in s:
+                        return 0
+                    if s.startswith("✅"):
+                        return 1
+                    if s.startswith("⏭️ SKIP"):
+                        return 2
+                    return 3
+
+                df_view = df.copy()
+                df_view["_p"] = df_view["status_akhir"].map(prio)
+                df_view = df_view.sort_values("_p").drop(columns=["_p"])
+
+                for _, r in df_view.iterrows():
                     if preview_limit == 0 or shown >= preview_limit:
                         break
                     if r.get("thumb") is None:
                         continue
                     with cols[shown % 4]:
                         st.image(r["thumb"], caption=f'{r["sheet"]} | {r["location"]}\n{r["status_akhir"]}')
+                        if r.get("skip_reason"):
+                            st.caption(r["skip_reason"])
                         if r.get("history_detail"):
                             st.caption(r["history_detail"])
                     shown += 1
