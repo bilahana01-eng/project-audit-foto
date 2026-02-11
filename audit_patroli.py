@@ -21,13 +21,13 @@ st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI")
 st.caption(
     "Audit foto patroli duplicate (Embedded Excel + Google Docs/Drive). "
-    "Foto yang ADA overlay GEO (kotak gelap + teks putih berisi timestamp/koordinat) akan DIAUDIT (VALID/GUGUR). "
-    "Foto LOGO-ONLY / banner-only akan di-SKIP (tidak masuk VALID/GUGUR). "
-    "Logo perusahaan di foto GEO itu BOLEH (tetap diaudit)."
+    "Aturan: LOGO-ONLY => SKIP (tidak masuk audit). "
+    "Foto patroli yang ada overlay GEO (kotak gelap + teks putih timestamp/koordinat) => DIAUDIT (VALID/GUGUR). "
+    "Logo perusahaan di foto GEO boleh (tetap diaudit)."
 )
 
 # =========================
-# STREAMLIT UI (UPLOADER DI ATAS)
+# UPLOADER + SETTINGS (DI ATAS)
 # =========================
 uploaded = st.file_uploader("Upload Excel Patroli (.xlsx)", type=["xlsx"])
 
@@ -35,7 +35,7 @@ colA, colB = st.columns([1, 2])
 with colA:
     preview_limit = st.number_input("Maks preview gambar", min_value=0, max_value=500, value=120, step=10)
 with colB:
-    st.info("Reset history ada di sidebar kiri. Logo-only tidak ikut audit, foto GEO overlay akan diaudit.")
+    st.info("Reset history ada di sidebar. Logo-only tidak ikut audit. Foto GEO overlay diaudit.")
 
 # =========================
 # DATABASE
@@ -122,7 +122,7 @@ def compute_hashes_from_bytes(img_bytes: bytes):
     return sh, ph, thumb, img
 
 # =========================
-# LOGO-ONLY DETECTION (UNTUK SKIP)
+# LOGO-ONLY DETECTION
 # =========================
 def image_entropy_gray(img: Image.Image) -> float:
     g = img.convert("L").resize((256, 256))
@@ -153,12 +153,11 @@ def dominant_color_count(img: Image.Image, k=16) -> int:
 
 def is_logo_only(img: Image.Image) -> tuple[bool, str]:
     """
-    Target: benar-benar logo/banner saja.
-    Jangan sampai foto GEO ketarik logo-only.
+    Target: gambar logo/banner doang.
     """
     w, h = img.size
     if w < 140 or h < 140:
-        return True, "LogoOnly: terlalu kecil"
+        return True, "LogoOnly: kecil"
 
     ar = w / max(h, 1)
     ent = image_entropy_gray(img)
@@ -167,26 +166,31 @@ def is_logo_only(img: Image.Image) -> tuple[bool, str]:
     g = img.convert("L").resize((256, 256))
     px = list(g.getdata())
     bright_ratio = sum(1 for p in px if p >= 238) / (len(px) or 1)
-
     dom_colors = dominant_color_count(img, k=16)
 
-    # logo putih dominan (FAMIKA putih)
-    if bright_ratio >= 0.65 and dom_colors <= 6 and ed <= 0.060:
-        return True, f"LogoOnly: bright={bright_ratio:.2f}, domColor={dom_colors}, edge={ed:.3f}"
+    # logo putih dominan
+    if bright_ratio >= 0.65 and dom_colors <= 6 and ed <= 0.070:
+        return True, f"LogoOnly: bright={bright_ratio:.2f}, dom={dom_colors}, edge={ed:.3f}"
 
-    # banner lebar (Indosat banner)
-    if ar >= 2.2 and ent <= 4.0 and dom_colors <= 8 and ed <= 0.080:
-        return True, f"LogoOnly: ar={ar:.2f}, ent={ent:.2f}, domColor={dom_colors}, edge={ed:.3f}"
+    # banner lebar
+    if ar >= 2.2 and ent <= 4.1 and dom_colors <= 8 and ed <= 0.090:
+        return True, f"LogoOnly: ar={ar:.2f}, ent={ent:.2f}, dom={dom_colors}, edge={ed:.3f}"
 
     # sangat flat
-    if ent < 3.2 and ed < 0.055 and dom_colors <= 8:
-        return True, f"LogoOnly: ent={ent:.2f}, edge={ed:.3f}, domColor={dom_colors}"
+    if ent <= 3.3 and ed <= 0.070 and dom_colors <= 8:
+        return True, f"LogoOnly: ent={ent:.2f}, edge={ed:.3f}, dom={dom_colors}"
 
-    return False, f"NotLogo: ent={ent:.2f}, edge={ed:.3f}, bright={bright_ratio:.2f}, domColor={dom_colors}"
+    return False, f"NotLogo: ent={ent:.2f}, edge={ed:.3f}, bright={bright_ratio:.2f}, dom={dom_colors}"
 
 # =========================
-# GEO OVERLAY DETECTION (DILONGGARKAN + PRIORITAS)
+# GEO OVERLAY DETECTION (ANTI FALSE POSITIVE)
 # =========================
+def patch_edge_density(patch_gray: Image.Image) -> float:
+    e = patch_gray.filter(ImageFilter.FIND_EDGES)
+    px = list(e.getdata())
+    mean = sum(px) / (len(px) or 1)
+    return mean / 255.0
+
 def _patch_stats(patch_gray: Image.Image):
     px = list(patch_gray.getdata())
     n = len(px) or 1
@@ -195,23 +199,27 @@ def _patch_stats(patch_gray: Image.Image):
     std = math.sqrt(var)
     white_ratio = sum(1 for p in px if p >= 215) / n
     dark_ratio  = sum(1 for p in px if p <= 95) / n
-    return mean, std, white_ratio, dark_ratio
+    ed = patch_edge_density(patch_gray)
+    return mean, std, white_ratio, dark_ratio, ed
 
 def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
     """
-    Deteksi overlay GEO (kotak gelap + teks putih).
-    FIX: threshold dilonggarkan karena overlay kadang transparan dan kecil.
-    Scan banyak ROI bawah.
+    Overlay GEO harus punya:
+    - ada area gelap (kotak)
+    - ada area putih (teks)
+    - kontras cukup
+    - edge cukup (teks -> edge)
+    Scan area bawah.
     """
     w, h = img.size
     if w < 240 or h < 240:
-        return False, "NonGEO: ukuran kecil"
+        return False, "NonGEO: kecil"
 
     rois = [
-        ("LB", (0.00, 0.62, 0.50, 1.00)),
-        ("MB", (0.20, 0.62, 0.80, 1.00)),
-        ("RB", (0.45, 0.62, 1.00, 1.00)),
-        ("RB2", (0.60, 0.70, 1.00, 1.00)),  # kanan bawah lebih kecil
+        ("LB",  (0.00, 0.62, 0.52, 1.00)),
+        ("MB",  (0.18, 0.62, 0.82, 1.00)),
+        ("RB",  (0.40, 0.62, 1.00, 1.00)),
+        ("RB2", (0.58, 0.72, 1.00, 1.00)),
     ]
 
     best_dbg = ""
@@ -219,21 +227,20 @@ def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
         X0 = int(w * x0); Y0 = int(h * y0)
         X1 = int(w * x1); Y1 = int(h * y1)
 
-        patch = img.crop((X0, Y0, X1, Y1)).convert("L").resize((240, 240))
-        mean, std, white_ratio, dark_ratio = _patch_stats(patch)
+        patch = img.crop((X0, Y0, X1, Y1)).convert("L").resize((260, 260))
+        mean, std, white_ratio, dark_ratio, ed = _patch_stats(patch)
 
-        # WAJIB dark box + white text (tapi threshold dibuat realistis)
-        has_dark_box = dark_ratio >= 0.006
+        # threshold diset agar foto GEO lolos, tapi logo-only gak ketipu
+        has_dark_box   = dark_ratio  >= 0.010
         has_white_text = white_ratio >= 0.003
-        has_contrast = std >= 10
-        mean_ok = mean <= 215  # jangan terlalu putih polos
+        has_contrast   = std >= 12
+        mean_ok        = mean <= 210
+        edge_ok        = ed >= 0.030
 
-        passed = has_dark_box and has_white_text and has_contrast and mean_ok
+        passed = has_dark_box and has_white_text and has_contrast and mean_ok and edge_ok
 
-        dbg = (
-            f"{name}: mean={mean:.1f}, std={std:.1f}, "
-            f"white={white_ratio:.3f}, dark={dark_ratio:.3f}, pass={passed}"
-        )
+        dbg = (f"{name}: mean={mean:.1f}, std={std:.1f}, "
+               f"white={white_ratio:.3f}, dark={dark_ratio:.3f}, edge={ed:.3f}, pass={passed}")
 
         if passed:
             return True, f"GEO✅ ({dbg})"
@@ -244,19 +251,19 @@ def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
 
 def classify_for_audit(img: Image.Image) -> tuple[bool, str, str]:
     """
-    FIX UTAMA SESUAI MAUMU:
-    1) Kalau GEO terdeteksi -> LANGSUNG AUDIT (logo pojok boleh).
-    2) Kalau tidak GEO:
-       - Logo-only -> SKIP (Logo-Only)
-       - Lainnya -> SKIP (Non-Patroli)
+    ATURAN FINAL SESUAI KAMU:
+    1) LOGO-ONLY -> SKIP (Logo-Only). STOP. (tidak boleh masuk audit)
+    2) Bukan logo-only:
+       - GEO true -> AUDIT
+       - GEO false -> SKIP (Non-Patroli)
     """
-    ok_geo, geo_dbg = overlay_geo_best(img)
-    if ok_geo:
-        return True, "", ""  # MASUK AUDIT
-
     logo, logo_dbg = is_logo_only(img)
     if logo:
         return False, "⏭️ SKIP (Logo-Only)", logo_dbg
+
+    ok_geo, geo_dbg = overlay_geo_best(img)
+    if ok_geo:
+        return True, "", ""  # AUDIT
 
     return False, "⏭️ SKIP (Non-Patroli)", geo_dbg
 
@@ -451,14 +458,14 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
                 "source_file": source_file_name,
                 "sheet": sheet,
                 "location": f"R{r}C{col_link}#IMG{idx}",
-                    "cluster": cluster,
-                    "segment": segment,
-                    "url": url,
-                    "sha256": sh,
-                    "phash": ph,
-                    "status_akhir": "",
-                    "skip_reason": "",
-                    "thumb": thumb
+                "cluster": cluster,
+                "segment": segment,
+                "url": url,
+                "sha256": sh,
+                "phash": ph,
+                "status_akhir": "",
+                "skip_reason": "",
+                "thumb": thumb
             })
         return out
 
