@@ -14,32 +14,34 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 
-# =========================
+# =========================================================
 # CONFIG UI
-# =========================
+# =========================================================
 st.set_page_config(page_title="Audit Foto Patroli", layout="wide")
 st.title("🕵️ AUDIT FOTO PATROLI")
 st.caption(
     "Audit foto patroli duplicate (Embedded Excel + Google Docs/Drive). "
-    "Yang DIAUDIT (VALID/GUGUR) hanya foto yang punya overlay GEO (kotak gelap + teks putih timestamp/koordinat). "
-    "Logo-only / banner-only -> SKIP (tidak masuk audit). "
-    "Logo perusahaan di foto GEO itu BOLEH (tetap diaudit)."
+    "✅ Yang DIAUDIT (VALID/GUGUR/CEK MANUAL) cuma foto patroli yang ada overlay GEO (kotak gelap + teks putih timestamp/koordinat biasanya di bawah). "
+    "✅ Foto GEO boleh ada logo perusahaan di pojok (tetap diaudit). "
+    "✅ Foto 'logo doang' (hitam/putih, banner, template) -> SKIP (Logo-Only), nggak masuk audit. "
+    "✅ Hash duplikat pakai MID+GEO crop (logo atas tidak ikut), jadi logo vendor tidak bikin semua foto dianggap duplikat. "
+    "✅ Output audit jelasin 'DUP OF' (rujukan duplikat: file/sheet/lokasi/segment/url) untuk duplikat internal & lintas bulan (DB)."
 )
 
-# =========================
+# =========================================================
 # STREAMLIT UI (UPLOADER HARUS DI ATAS)
-# =========================
+# =========================================================
 uploaded = st.file_uploader("Upload Excel Patroli (.xlsx)", type=["xlsx"])
 
 colA, colB = st.columns([1, 2])
 with colA:
     preview_limit = st.number_input("Maks preview gambar", min_value=0, max_value=500, value=200, step=10)
 with colB:
-    st.info("Reset history ada di sidebar kiri. Logo-only tidak ikut audit, foto overlay GEO akan diaudit.")
+    st.info("Reset history ada di sidebar kiri. Logo-only tidak ikut audit. Hash audit pakai MID+GEO crop supaya logo vendor tidak bikin semua foto dianggap duplikat.")
 
-# =========================
+# =========================================================
 # DATABASE
-# =========================
+# =========================================================
 DB_PATH = "audit_history.db"
 
 def get_db():
@@ -84,9 +86,9 @@ def db_insert(conn, row: dict):
         row["sheet"], row["location"], row["cluster"], row["segment"], row["url"], row["first_seen"]
     ))
 
-# =========================
+# =========================================================
 # RESET / HAPUS HISTORY AUDIT (SIDEBAR)
-# =========================
+# =========================================================
 st.sidebar.subheader("🧹 Reset History Audit")
 confirm_reset = st.sidebar.checkbox("Saya yakin mau hapus total history", value=False)
 
@@ -104,29 +106,15 @@ if st.sidebar.button("🗑️ HAPUS TOTAL HISTORY (RESET)"):
         except Exception as e:
             st.sidebar.error(f"❌ Gagal hapus DB: {e}")
 
-# =========================
+# =========================================================
 # HASHING
-# =========================
+# =========================================================
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
-def compute_hashes_from_bytes(img_bytes: bytes):
-    """
-    Return: sha256, phash, thumb, full_img
-    """
-    try:
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    except UnidentifiedImageError:
-        return None, None, None, None
-    thumb = img.copy()
-    thumb.thumbnail((260, 260))
-    ph = str(imagehash.phash(thumb))
-    sh = sha256_bytes(img_bytes)
-    return sh, ph, thumb, img
-
-# =========================
-# METRIK VISUAL
-# =========================
+# =========================================================
+# METRIK VISUAL (LOGO-ONLY)
+# =========================================================
 def image_entropy_gray(img: Image.Image) -> float:
     g = img.convert("L").resize((256, 256))
     hist = g.histogram()
@@ -146,11 +134,7 @@ def edge_density(img: Image.Image) -> float:
     mean = sum(px) / (len(px) or 1)
     return mean / 255.0
 
-def unique_color_ratio(img: Image.Image, k=32) -> float:
-    """
-    Approx jumlah warna unik setelah quantize.
-    Logo-only biasanya warna sedikit.
-    """
+def unique_color_ratio(img: Image.Image, k=24) -> float:
     small = img.resize((256, 256))
     q = small.quantize(colors=k, method=2)  # adaptive
     px = list(q.getdata())
@@ -162,70 +146,41 @@ def bright_ratio(img: Image.Image, thr=240) -> float:
     px = list(g.getdata())
     return sum(1 for p in px if p >= thr) / (len(px) or 1)
 
-def dark_ratio(img: Image.Image, thr=20) -> float:
-    g = img.convert("L").resize((256, 256))
-    px = list(g.getdata())
-    return sum(1 for p in px if p <= thr) / (len(px) or 1)
-
-def saturation_mean(img: Image.Image) -> float:
-    # bantu bedain logo flat (saturasi rendah) vs foto asli (biasanya lebih variatif)
-    hsv = img.resize((256, 256)).convert("HSV")
-    s = list(hsv.getchannel("S").getdata())
-    return (sum(s) / (len(s) or 1)) / 255.0
-
-# =========================
-# DETEKSI LOGO-ONLY (PUTIH/HITAM/FLAT)
-# =========================
 def is_logo_only(img: Image.Image) -> tuple[bool, str]:
     """
-    Wajib nangkep:
-      - logo putih di background putih
-      - logo gelap / banner hitam
-      - template flat
+    Target: logo/banner/template yang cuma logo doang (hitam/putih).
+    HARUS SKIP.
 
-    Prinsip:
-      - logo-only itu flat: edge rendah, warna efektif sedikit, tekstur rendah
-      - foto GEO/pemandangan: edge lebih tinggi, warna lebih variatif, tekstur lebih tinggi
-
-    NOTE:
-    Kita TIDAK mau salah-skip foto GEO.
-    Karena itu rule logo-only hanya dipakai kalau NON-GEO (di classify_for_audit kita cek GEO dulu).
+    Heuristik:
+      - edge rendah (flat)
+      - warna sedikit
+      - salah satu:
+        a) background putih dominan (logo putih)
+        b) entropi rendah (logo gelap / flat)
     """
     w, h = img.size
     if w < 140 or h < 140:
         return True, "LogoOnly: terlalu kecil"
 
-    ent = image_entropy_gray(img)        # 0..8 (kira-kira)
-    ed  = edge_density(img)              # 0..1
-    ucr = unique_color_ratio(img, k=32)  # 0..1
-    br  = bright_ratio(img, thr=240)     # 0..1
-    dr  = dark_ratio(img, thr=20)        # 0..1
-    sat = saturation_mean(img)           # 0..1
+    ent = image_entropy_gray(img)
+    ed  = edge_density(img)
+    ucr = unique_color_ratio(img, k=24)
+    br  = bright_ratio(img, thr=240)
 
-    # 1) WHITE LOGO on WHITE BG
-    # background putih dominan + warna sedikit + edge rendah
-    if br >= 0.62 and ucr <= 0.55 and ed <= 0.070:
-        return True, f"LogoOnly(WhiteBG): bright={br:.2f}, ucol={ucr:.2f}, edge={ed:.3f}, ent={ent:.2f}"
+    # logo putih: putih dominan + warna sedikit + edge rendah
+    if br >= 0.58 and ucr <= 0.45 and ed <= 0.070:
+        return True, f"LogoOnly(WhiteBG): bright={br:.2f}, ucol={ucr:.2f}, edge={ed:.3f}"
 
-    # 2) DARK BANNER / BLACK LOGO
-    # area gelap dominan + warna sedikit + edge rendah
-    if dr >= 0.45 and ucr <= 0.55 and ed <= 0.080:
-        return True, f"LogoOnly(DarkBG): dark={dr:.2f}, ucol={ucr:.2f}, edge={ed:.3f}, ent={ent:.2f}"
+    # logo gelap/flat: entropi rendah + warna sedikit + edge rendah
+    if ent <= 4.20 and ucr <= 0.45 and ed <= 0.070:
+        return True, f"LogoOnly(Flat): ent={ent:.2f}, ucol={ucr:.2f}, edge={ed:.3f}"
 
-    # 3) FLAT TEMPLATE (warna sedikit, entropi rendah, edge rendah)
-    if ent <= 4.30 and ucr <= 0.50 and ed <= 0.075:
-        return True, f"LogoOnly(Flat): ent={ent:.2f}, ucol={ucr:.2f}, edge={ed:.3f}, sat={sat:.2f}"
+    return False, f"NotLogo: ent={ent:.2f}, ucol={ucr:.2f}, edge={ed:.3f}"
 
-    # 4) Extra: kalau saturasi sangat rendah + edge rendah + warna sedikit (logo vector / text)
-    if sat <= 0.12 and ucr <= 0.55 and ed <= 0.070:
-        return True, f"LogoOnly(LowSat): sat={sat:.2f}, ucol={ucr:.2f}, edge={ed:.3f}, ent={ent:.2f}"
-
-    return False, f"NotLogo: ent={ent:.2f}, ucol={ucr:.2f}, edge={ed:.3f}, bright={br:.2f}, dark={dr:.2f}, sat={sat:.2f}"
-
-# =========================
+# =========================================================
 # DETEKSI GEO OVERLAY (SCAN BAWAH)
-# =========================
-def _patch_stats(patch_gray: Image.Image):
+# =========================================================
+def _patch_stats_gray(patch_gray: Image.Image):
     px = list(patch_gray.getdata())
     n = len(px) or 1
     mean = sum(px) / n
@@ -233,22 +188,21 @@ def _patch_stats(patch_gray: Image.Image):
     std = math.sqrt(var)
     white_ratio = sum(1 for p in px if p >= 220) / n
     dark_ratio  = sum(1 for p in px if p <= 70) / n
-    # edge di patch (teks meningkatkan edge)
+    # edge patch: teks biasanya bikin edge naik
     pedge = edge_density(patch_gray.convert("RGB"))
     return mean, std, white_ratio, dark_ratio, pedge
 
-def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
+def overlay_geo_best(img: Image.Image) -> tuple[bool, str, tuple[int,int,int,int] | None]:
     """
-    Overlay GEO biasa di area bawah.
-    Rule: minimal 2 indikator:
-      - white text ratio
-      - dark box ratio
-      - contrast std
-      - patch edge
+    Scan 3 area bawah: kiri, tengah, kanan.
+    Output:
+      - ok (bool)
+      - dbg string
+      - roi bbox terbaik (X0,Y0,X1,Y1) untuk crop GEO
     """
     w, h = img.size
     if w < 240 or h < 240:
-        return False, "NonGEO: ukuran kecil"
+        return False, "NonGEO: ukuran kecil", None
 
     rois = [
         ("LB", (0.00, 0.62, 0.50, 1.00)),
@@ -258,18 +212,19 @@ def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
 
     best_score = -1
     best_dbg = ""
+    best_bbox = None
 
     for name, (x0, y0, x1, y1) in rois:
         X0 = int(w * x0); Y0 = int(h * y0)
         X1 = int(w * x1); Y1 = int(h * y1)
 
-        patch = img.crop((X0, Y0, X1, Y1)).convert("L").resize((280, 280))
-        mean, std, white_ratio, dark_ratio, pedge = _patch_stats(patch)
+        patch = img.crop((X0, Y0, X1, Y1)).convert("L").resize((260, 260))
+        mean, std, white_ratio, dark_ratio, pedge = _patch_stats_gray(patch)
 
-        has_white_text = white_ratio >= 0.003   # 0.3%
-        has_dark_box   = dark_ratio  >= 0.006   # 0.6%
+        has_white_text = white_ratio >= 0.003
+        has_dark_box   = dark_ratio  >= 0.006
         has_contrast   = std >= 14
-        has_patch_edge = pedge >= 0.028
+        has_patch_edge = pedge >= 0.030
 
         score = int(has_white_text) + int(has_dark_box) + int(has_contrast) + int(has_patch_edge)
         dbg = (
@@ -280,11 +235,70 @@ def overlay_geo_best(img: Image.Image) -> tuple[bool, str]:
         if score > best_score:
             best_score = score
             best_dbg = dbg
+            best_bbox = (X0, Y0, X1, Y1)
 
     if best_score >= 2:
-        return True, f"GEO✅ ({best_dbg})"
-    return False, f"NonGEO ({best_dbg})"
+        return True, f"GEO✅ ({best_dbg})", best_bbox
+    return False, f"NonGEO ({best_dbg})", best_bbox
 
+# =========================================================
+# MID+GEO CROP untuk PHASH (logo atas tidak ikut)
+# =========================================================
+def crop_mid(img: Image.Image) -> Image.Image:
+    w, h = img.size
+    x0 = int(w * 0.10)
+    x1 = int(w * 0.90)
+    y0 = int(h * 0.15)   # buang atas (logo)
+    y1 = int(h * 0.75)   # jangan kebanyakan bawah
+    if x1 <= x0 or y1 <= y0:
+        return img
+    return img.crop((x0, y0, x1, y1))
+
+def crop_geo_best_patch(img: Image.Image, bbox: tuple[int,int,int,int] | None) -> Image.Image:
+    w, h = img.size
+    if bbox:
+        X0, Y0, X1, Y1 = bbox
+        if X1 > X0 and Y1 > Y0:
+            return img.crop((X0, Y0, X1, Y1))
+    # fallback RB
+    return img.crop((int(w*0.50), int(h*0.62), w, h))
+
+def compose_audit_image(img: Image.Image, geo_bbox: tuple[int,int,int,int] | None) -> Image.Image:
+    """
+    Gabung MID + GEO menjadi satu canvas -> dipakai untuk phash.
+    """
+    mid = crop_mid(img).resize((512, 512))
+    geo = crop_geo_best_patch(img, geo_bbox).resize((512, 256))
+
+    canvas = Image.new("RGB", (512, 768))
+    canvas.paste(mid, (0, 0))
+    canvas.paste(geo, (0, 512))
+    return canvas
+
+def compute_hashes_from_bytes(img_bytes: bytes):
+    """
+    Return: sha256(full bytes), phash(MID+GEO), thumb(preview), full_img
+    """
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    except UnidentifiedImageError:
+        return None, None, None, None
+
+    thumb = img.copy()
+    thumb.thumbnail((260, 260))
+
+    sh = sha256_bytes(img_bytes)
+
+    # geo bbox untuk hashing (kalau bukan geo, tetap bikin bbox terbaik agar stabil)
+    _, _, geo_bbox = overlay_geo_best(img)
+    audit_img = compose_audit_image(img, geo_bbox)
+    ph = str(imagehash.phash(audit_img))
+
+    return sh, ph, thumb, img
+
+# =========================================================
+# CLASSIFY FINAL
+# =========================================================
 def classify_for_audit(img: Image.Image) -> tuple[bool, str, str]:
     """
     RULE FINAL:
@@ -293,7 +307,7 @@ def classify_for_audit(img: Image.Image) -> tuple[bool, str, str]:
          - kalau logo-only -> SKIP (Logo-Only)
          - selain itu -> SKIP (Non-Patroli)
     """
-    ok_geo, geo_dbg = overlay_geo_best(img)
+    ok_geo, geo_dbg, _ = overlay_geo_best(img)
     if ok_geo:
         return True, "", ""
 
@@ -303,9 +317,9 @@ def classify_for_audit(img: Image.Image) -> tuple[bool, str, str]:
 
     return False, "⏭️ SKIP (Non-Patroli)", geo_dbg
 
-# =========================
+# =========================================================
 # GOOGLE LINK HANDLING
-# =========================
+# =========================================================
 DOC_ID_RE = re.compile(r"/document/d/([a-zA-Z0-9_-]+)")
 DRIVE_FILE_ID_RE = re.compile(r"/file/d/([a-zA-Z0-9_-]+)")
 GENERIC_ID_RE = re.compile(r"(?:id=)([a-zA-Z0-9_-]+)")
@@ -362,9 +376,9 @@ def download_images_from_url(url: str) -> list[bytes]:
 
     return []
 
-# =========================
+# =========================================================
 # EXCEL PARSING
-# =========================
+# =========================================================
 def find_header_row_and_cols(ws, max_scan_rows=40):
     target = {"cluster": ["cluster"], "segment": ["segment", "segment name", "segmen"], "link": ["link", "url"]}
     def norm(v): return str(v).strip().lower() if v is not None else ""
@@ -465,6 +479,7 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
     def worker(job):
         sheet, r, col_link, cluster, segment, url = job
         img_bytes_list = download_images_from_url(url)
+
         out = []
         for idx, b in enumerate(img_bytes_list, start=1):
             if not b:
@@ -517,9 +532,9 @@ def extract_link_images(wb, source_file_name: str, max_workers=12):
 
     return items
 
-# =========================
-# DUP OF MAPPER (INTERNAL + HISTORY)
-# =========================
+# =========================================================
+# DUP OF (INTERNAL + HISTORY)
+# =========================================================
 def _ref_string(row: dict) -> str:
     return (
         f'{row.get("source_file","")} | {row.get("sheet","")} | {row.get("location","")} | '
@@ -528,12 +543,11 @@ def _ref_string(row: dict) -> str:
 
 def apply_dup_of_columns(df_audit: pd.DataFrame, conn) -> pd.DataFrame:
     df = df_audit.copy()
-
     for c in ["dup_of_type", "dup_of_detail"]:
         if c not in df.columns:
             df[c] = ""
 
-    # INTERNAL EXACT
+    # INTERNAL EXACT: sha256
     first_by_sha = {}
     for i, r in df.iterrows():
         sha = str(r.get("sha256", "")).strip()
@@ -546,7 +560,7 @@ def apply_dup_of_columns(df_audit: pd.DataFrame, conn) -> pd.DataFrame:
             df.at[i, "dup_of_type"] = "INTERNAL_EXACT"
             df.at[i, "dup_of_detail"] = _ref_string(ref)
 
-    # INTERNAL PHASH
+    # INTERNAL PHASH: (hash MID+GEO)
     first_by_ph = {}
     for i, r in df.iterrows():
         if str(df.at[i, "dup_of_type"]).strip():
@@ -561,7 +575,7 @@ def apply_dup_of_columns(df_audit: pd.DataFrame, conn) -> pd.DataFrame:
             df.at[i, "dup_of_type"] = "INTERNAL_PHASH"
             df.at[i, "dup_of_detail"] = _ref_string(ref)
 
-    # HISTORY
+    # HISTORY (kalau belum kena internal)
     for i, r in df.iterrows():
         if str(df.at[i, "dup_of_type"]).strip():
             continue
@@ -582,9 +596,9 @@ def apply_dup_of_columns(df_audit: pd.DataFrame, conn) -> pd.DataFrame:
 
     return df
 
-# =========================
+# =========================================================
 # AUDIT LOGIC
-# =========================
+# =========================================================
 def audit_workbook(xlsx_path: str):
     wb = load_workbook(xlsx_path, data_only=True)
     source_file_name = os.path.basename(xlsx_path)
@@ -597,12 +611,17 @@ def audit_workbook(xlsx_path: str):
     df_audit = df[audited_mask].copy()
     df_skip = df[~audited_mask].copy()
 
-    base_cols = ["dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen","dup_of_type","dup_of_detail"]
+    base_cols = [
+        "dup_internal_exact","dup_internal_phash","history_status","history_detail","first_seen",
+        "dup_of_type","dup_of_detail"
+    ]
+
     if df_audit.empty:
         for col in base_cols:
             df[col] = ""
         return df
 
+    # duplikat internal (exact bytes & phash MID+GEO)
     df_audit["dup_internal_exact"] = df_audit.duplicated("sha256", keep="first")
     df_audit["dup_internal_phash"] = df_audit.duplicated("phash", keep="first")
 
@@ -610,8 +629,10 @@ def audit_workbook(xlsx_path: str):
     today = datetime.now().strftime("%Y-%m-%d")
     df_audit["first_seen"] = today
 
+    # DUP OF detail
     df_audit = apply_dup_of_columns(df_audit, conn)
 
+    # history status (human-friendly)
     hist_status, hist_detail = [], []
     for _, row in df_audit.iterrows():
         exact, ph = db_lookup(conn, row["sha256"], row["phash"])
@@ -640,6 +661,7 @@ def audit_workbook(xlsx_path: str):
 
     df_audit["status_akhir"] = df_audit.apply(decide, axis=1)
 
+    # simpan hanya VALID ke history (lintas bulan)
     for _, r in df_audit[df_audit["status_akhir"] == "✅ VALID"].iterrows():
         db_insert(conn, {
             "sha256": r["sha256"],
@@ -656,15 +678,16 @@ def audit_workbook(xlsx_path: str):
     conn.commit()
     conn.close()
 
+    # rapihin skip col
     for col in base_cols:
         if col not in df_skip.columns:
             df_skip[col] = ""
 
     return pd.concat([df_audit, df_skip], ignore_index=True)
 
-# =========================
+# =========================================================
 # RUN UI ACTIONS
-# =========================
+# =========================================================
 if uploaded:
     tmp_path = "temp_upload.xlsx"
     with open(tmp_path, "wb") as f:
